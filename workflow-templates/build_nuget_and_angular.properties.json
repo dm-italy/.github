@@ -1,0 +1,13 @@
+{
+    "name": "DM Dotnet & Angular",
+    "description": "Build module with dotnet and anugalr.",
+    "iconName": "example-icon",
+    "categories": [
+        "dotnet","Angular"
+    ],
+    "filePatterns": [
+        "package.json$",
+        "^Dockerfile",
+        ".*\\.sln"
+    ]
+}
