@@ -18,14 +18,11 @@ on:
         required: false
         default: true
         type: boolean
-permissions:
-  contents: write
-  packages: write
-
+permissions: write-all
 env:
   DOTNET_VERSION: '8.0.x'
   NODE_VERSION: '18.x'
-  SOLUTION_PATH: 'Dm.WareHouseManagement.sln'
+  SOLUTION_PATH: 'Dm.Crm.sln'
   BUILD_CONFIGURATION: 'Release'
 
 jobs:
@@ -186,12 +183,11 @@ jobs:
           echo "Publishing package: $package"
           dotnet nuget push "$package" \
             --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
-            --api-key ${{ secrets.GITHUB_TOKEN }} \
-            --skip-duplicate
+            --api-key ${{ secrets.GIT_PUSH_TOKEN }} \
+            --skip-duplicate 
         done
 
     - name: Commit and push version changes
-      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
       run: |
         echo "Building from branch: ${{ github.ref_name }}"
         if [ -n "$(git status --porcelain)" ]; then
@@ -216,8 +212,8 @@ jobs:
     if: always() && needs.build-dotnet.result == 'success' && inputs.build-angular == true
     
     env:
-      ANGULAR_FOLDER: 'angular/projects'  # Adatta al tuo path
-      DIST_FOLDER: 'angular/dist/ware-house-management'
+      ANGULAR_FOLDER: 'angular'  # Adatta al tuo path
+      DIST_FOLDER: 'angular/dist/crm'
     
     steps:
     - name: Checkout repository
@@ -226,25 +222,23 @@ jobs:
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: ${{ env.NODE_VERSION }}
+        node-version: ${{ vars.NODE_VERSION }}
         registry-url: 'https://npm.pkg.github.com'
         scope: '@${{ github.repository_owner }}'
     
     - name: Setup Yarn
       run: |
         corepack enable
-        yarn set version stable
+        yarn set version ${{ vars.YARN_VERSION }}
     
     - name: Install dependencies
       working-directory: ${{ env.ANGULAR_FOLDER }}
       run: |
+        pwd
+        ls *.lock
         if [ -f "yarn.lock" ]; then
           echo "Using Yarn..."
-          # Crea un yarn.lock vuoto nella root se non esiste per evitare errori workspace
-          if [ ! -f "../yarn.lock" ]; then
-            touch ../yarn.lock
-          fi
-          yarn install --immutable
+          yarn install
         elif [ -f "package-lock.json" ]; then
           echo "Using npm with lockfile..."
           npm ci
