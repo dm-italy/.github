@@ -1,0 +1,338 @@
+name: Build and Publish NuGet Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build from'
+        required: false
+        default: 'main'
+        type: string
+      skip-tests:
+        description: 'Skip .NET running tests'
+        required: false
+        default: true
+        type: boolean
+      build-angular:
+        description: 'Build Angular application'
+        required: false
+        default: true
+        type: boolean
+permissions:
+  contents: write
+  packages: write
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  NODE_VERSION: '18.x'
+  SOLUTION_PATH: 'Dm.WareHouseManagement.sln'
+  BUILD_CONFIGURATION: 'Release'
+
+jobs:
+  build-dotnet:
+    runs-on: [self-hosted, dotnet]
+    outputs:
+      package-version: ${{ steps.set-version.outputs.version }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Setup Git
+      run: |
+        git config --global user.email "buildservice@github-actions.com"
+        git config --global user.name "github-actions[bot]"
+    
+    - name: Check if package.json exists
+      id: check-npm
+      run: |
+        if [ -f "package.json" ]; then
+          echo "has-npm=true" >> $GITHUB_OUTPUT
+          echo "package.json found"
+        else
+          echo "has-npm=false" >> $GITHUB_OUTPUT
+          echo "package.json not found"
+        fi
+    
+    - name: Setup Node.js
+      if: steps.check-npm.outputs.has-npm == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+    
+    - name: Install npm dependencies
+      if: steps.check-npm.outputs.has-npm == 'true'
+      run: npm install
+    
+    - name: Delete unpushed tags
+      run: |
+        echo "Identifying and removing unpushed tags..."
+        
+        # Get all local tags
+        local_tags=$(git tag)
+        
+        # Get all remote tags
+        remote_tags=$(git ls-remote --tags origin | cut -d/ -f3)
+        
+        # Find tags that exist only locally
+        unpushed_tags=""
+        for tag in $local_tags; do
+          if ! echo "$remote_tags" | grep -q "^$tag$"; then
+            unpushed_tags="$unpushed_tags $tag"
+          fi
+        done
+        
+        if [ -n "$unpushed_tags" ]; then
+          echo "Unpushed tags found: $unpushed_tags"
+          for tag in $unpushed_tags; do
+            echo "Deleting local tag: $tag"
+            git tag -d $tag
+          done
+          echo "All unpushed tags have been deleted."
+        else
+          echo "No unpushed tags found."
+        fi
+    
+    - name: Create release version
+      if: steps.check-npm.outputs.has-npm == 'true'
+      run: npm run release
+
+    - name: Set version from package.json
+      id: set-version
+      run: |
+        if [ -f "package.json" ]; then
+          app_version=$(npm pkg get version | tr -d '"')
+          echo "New Version: $app_version"
+          echo "version=$app_version" >> $GITHUB_OUTPUT
+          echo "PACKAGE_VERSION=$app_version" >> $GITHUB_ENV
+        else
+          # Default version if no package.json found
+          app_version="1.0.0"
+          echo "Using default version: $app_version"
+          echo "version=$app_version" >> $GITHUB_OUTPUT
+          echo "PACKAGE_VERSION=$app_version" >> $GITHUB_ENV
+        fi
+    
+    - name: Update common.props version
+      run: |
+        find . -name "common.props" -type f -exec sed -i "s|<Version>[0-9][0-9.]*</Version>|<Version>${PACKAGE_VERSION}</Version>|g" {} +
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+      env:
+        DOTNET_INSTALL_DIR: ${{ github.workspace }}/.dotnet
+    
+    - name: Add .NET to PATH
+      run: |
+        echo "${{ github.workspace }}/.dotnet" >> $GITHUB_PATH
+        echo "DOTNET_ROOT=${{ github.workspace }}/.dotnet" >> $GITHUB_ENV
+   
+    - name: Restore NuGet packages
+      run: |
+        if [ -f "NuGet.Config" ]; then
+          dotnet restore ${{ env.SOLUTION_PATH }} --configfile NuGet.Config
+        else
+          dotnet restore ${{ env.SOLUTION_PATH }}
+        fi
+
+    - name: Build solution
+      run: |
+        echo "Building all projects in src folder..."
+        for project in src/*/*.csproj; do
+          if [ -f "$project" ]; then
+            echo "Building $project"
+            dotnet build "$project" \
+              --configuration ${{ env.BUILD_CONFIGURATION }} \
+              --no-restore \
+              --verbosity minimal
+          fi
+        done
+    
+    - name: Run tests
+      if: inputs.skip-tests != true
+      run: |
+        dotnet test test/**/*.csproj \
+          --configuration ${{ env.BUILD_CONFIGURATION }} \
+          --no-build \
+          --verbosity minimal \
+          --logger trx \
+          --collect:"XPlat Code Coverage"
+      continue-on-error: true
+    
+    - name: Pack NuGet packages
+      run: |
+        echo "Packing NuGet packages..."
+        mkdir -p ./packages
+        for project in src/*/*.csproj; do
+          if [ -f "$project" ]; then
+            echo "Packing $project"
+            dotnet pack "$project" \
+              --configuration ${{ env.BUILD_CONFIGURATION }} \
+              --no-build \
+              --output ./packages \
+              --verbosity minimal \
+              -p:PackageVersion=${{ env.PACKAGE_VERSION }}
+          fi
+        done
+    
+    - name: Publish NuGet packages to GitHub
+      run: |
+        for package in ./packages/*.nupkg; do
+          echo "Publishing package: $package"
+          dotnet nuget push "$package" \
+            --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
+            --api-key ${{ secrets.GITHUB_TOKEN }} \
+            --skip-duplicate
+        done
+
+    - name: Commit and push version changes
+      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+      run: |
+        echo "Building from branch: ${{ github.ref_name }}"
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "Changes detected, committing..."
+          git add .
+          git commit -m "chore: update version to ${{ env.PACKAGE_VERSION }} [skip ci]"
+          git push --follow-tags origin HEAD:${{ github.ref_name }}
+        else
+          echo "No changes to commit"
+        fi
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: nuget-packages
+        path: ./packages/*.nupkg
+        retention-days: 7
+
+  build-angular:
+    runs-on: [self-hosted, dotnet]
+    needs: build-dotnet
+    if: always() && needs.build-dotnet.result == 'success' && inputs.build-angular == true
+    
+    env:
+      ANGULAR_FOLDER: 'angular/projects'  # Adatta al tuo path
+      DIST_FOLDER: 'angular/dist/ware-house-management'
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        registry-url: 'https://npm.pkg.github.com'
+        scope: '@${{ github.repository_owner }}'
+    
+    - name: Setup Yarn
+      run: |
+        corepack enable
+        yarn set version stable
+    
+    - name: Install dependencies
+      working-directory: ${{ env.ANGULAR_FOLDER }}
+      run: |
+        if [ -f "yarn.lock" ]; then
+          echo "Using Yarn..."
+          # Crea un yarn.lock vuoto nella root se non esiste per evitare errori workspace
+          if [ ! -f "../yarn.lock" ]; then
+            touch ../yarn.lock
+          fi
+          yarn install --immutable
+        elif [ -f "package-lock.json" ]; then
+          echo "Using npm with lockfile..."
+          npm ci
+        else
+          echo "Using npm install..."
+          npm install
+        fi
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Apply Telerik License (if needed)
+      working-directory: ${{ env.ANGULAR_FOLDER }}
+      if: env.KENDO_UI_LICENSE
+      run: npx kendo-ui-license activate
+      env:
+        KENDO_UI_LICENSE: ${{ secrets.KENDO_UI_LICENSE }}
+    
+    - name: Build Angular application
+      working-directory: ${{ env.ANGULAR_FOLDER }}
+      run: |
+        if [ -f "yarn.lock" ]; then
+          echo "Building with Yarn..."
+          yarn build
+        else
+          echo "Building with npm..."
+          npm run build
+        fi
+    
+    - name: Update package.json version in dist
+      working-directory: ${{ env.DIST_FOLDER }}
+      run: |
+        if [ -f "package.json" ]; then
+          # Aggiorna versione
+          npm version ${{ needs.build-dotnet.outputs.package-version }} --no-git-tag-version
+          
+          # Assicura che il nome sia corretto per GitHub Packages
+          current_name=$(npm pkg get name | tr -d '"')
+          if [[ ! $current_name == @${{ github.repository_owner }}/* ]]; then
+            # Estrai il nome base del pacchetto (senza scope)
+            base_name=${current_name#@*/}  # rimuove @scope/ se presente
+            base_name=${base_name:-"ware-house-management"}  # default se vuoto
+            
+            new_name="@${{ github.repository_owner }}/${base_name}"
+            echo "Updating package name from '$current_name' to '$new_name'"
+            npm pkg set name="$new_name"
+          fi
+          
+          # Configura publishConfig per GitHub Packages privato
+          npm pkg set publishConfig.registry="https://npm.pkg.github.com"
+          npm pkg set publishConfig.access="restricted"
+        fi
+    
+    - name: Publish npm package to GitHub (Private)
+      working-directory: ${{ env.DIST_FOLDER }}
+      if: github.ref == 'refs/heads/main'
+      run: |
+        if [ -f "package.json" ]; then
+          echo "Configuring npm for private GitHub Packages..."
+          
+          # Configura SOLO GitHub Packages (non npmjs.org)
+          npm config set registry https://npm.pkg.github.com
+          npm config set //npm.pkg.github.com/:_authToken ${{ secrets.GITHUB_TOKEN }}
+          
+          # Verifica che non sia marcato come private
+          is_private=$(npm pkg get private | tr -d '"')
+          if [ "$is_private" = "true" ]; then
+            echo "Removing private flag to allow publishing..."
+            npm pkg delete private
+          fi
+
+          # Verifica configurazione
+          echo "Package configuration:"
+          npm pkg get name
+          npm pkg get version  
+          npm pkg get private
+          npm pkg get publishConfig
+          
+          echo "Publishing private npm package to GitHub Packages..."
+          npm publish --registry https://npm.pkg.github.com
+        fi
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    
+    # - name: Upload Angular build artifacts
+    #   enable: true
+    #   uses: actions/upload-artifact@v4
+    #   with:
+    #     name: angular-build
+    #     path: ${{ env.DIST_FOLDER }}
+    #     retention-days: 7
