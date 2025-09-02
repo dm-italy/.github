@@ -1,4 +1,4 @@
-name: Build and Publish NuGet Package
+name: Build Dynamic Template Module
 
 on:
   workflow_dispatch:
@@ -18,11 +18,13 @@ on:
         required: false
         default: true
         type: boolean
-permissions: write-all
+permissions:
+  contents: write
+  packages: write
+
 env:
   DOTNET_VERSION: '8.0.x'
-  NODE_VERSION: '18.x'
-  SOLUTION_PATH: 'Dm.Crm.sln'
+  SOLUTION_PATH: 'Dm.DynamicTemplate.sln'
   BUILD_CONFIGURATION: 'Release'
 
 jobs:
@@ -58,7 +60,7 @@ jobs:
       if: steps.check-npm.outputs.has-npm == 'true'
       uses: actions/setup-node@v4
       with:
-        node-version: ${{ env.NODE_VERSION }}
+        node-version: ${{ vars.NODE_VERSION }}
     
     - name: Install npm dependencies
       if: steps.check-npm.outputs.has-npm == 'true'
@@ -213,7 +215,7 @@ jobs:
     
     env:
       ANGULAR_FOLDER: 'angular'  # Adatta al tuo path
-      DIST_FOLDER: 'angular/dist/crm'
+      DIST_FOLDER: 'angular/dist/dynamic-template'
     
     steps:
     - name: Checkout repository
@@ -235,17 +237,8 @@ jobs:
       working-directory: ${{ env.ANGULAR_FOLDER }}
       run: |
         pwd
-        ls *.lock
-        if [ -f "yarn.lock" ]; then
-          echo "Using Yarn..."
-          yarn install
-        elif [ -f "package-lock.json" ]; then
-          echo "Using npm with lockfile..."
-          npm ci
-        else
-          echo "Using npm install..."
-          npm install
-        fi
+        echo "Using Yarn..."
+        yarn install
       env:
         NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     
@@ -293,14 +286,13 @@ jobs:
     
     - name: Publish npm package to GitHub (Private)
       working-directory: ${{ env.DIST_FOLDER }}
-      if: github.ref == 'refs/heads/main'
       run: |
         if [ -f "package.json" ]; then
           echo "Configuring npm for private GitHub Packages..."
           
           # Configura SOLO GitHub Packages (non npmjs.org)
           npm config set registry https://npm.pkg.github.com
-          npm config set //npm.pkg.github.com/:_authToken ${{ secrets.GITHUB_TOKEN }}
+          npm config set //npm.pkg.github.com/:_authToken ${{ secrets.GIT_PUSH_TOKEN }}
           
           # Verifica che non sia marcato come private
           is_private=$(npm pkg get private | tr -d '"')
