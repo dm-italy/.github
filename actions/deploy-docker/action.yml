@@ -1,0 +1,544 @@
+name: 'Deploy Docker Container with Compose'
+description: 'Deploy and run Docker container on remote host using docker-compose with advanced configuration'
+author: 'DiemmeGroup DevOps'
+
+inputs:
+  ssh_key:
+    description: 'SSH private key for authentication'
+    required: true
+  ssh_host:
+    description: 'Target Docker host'
+    required: true
+  ssh_user:
+    description: 'SSH username for deployment'
+    required: true
+  docker_image:
+    description: 'Full Docker image reference (e.g., ghcr.io/org/image:tag)'
+    required: true
+  container_name:
+    description: 'Container name'
+    required: true
+  host_port:
+    description: 'Host port mapping'
+    required: true
+  container_port:
+    description: 'Container internal port'
+    required: true
+  environment_vars:
+    description: 'Environment variables as JSON object (e.g., {"KEY":"value"})'
+    required: false
+    default: '{}'
+  volume_mounts:
+    description: 'Volume mounts as JSON array of strings (e.g., ["/host/path:/container/path:ro"])'
+    required: false
+    default: '[]'
+  registry_url:
+    description: 'Docker registry URL'
+    required: false
+    default: 'ghcr.io'
+  registry_username:
+    description: 'Docker registry username'
+    required: false
+  registry_password:
+    description: 'Docker registry password'
+    required: false
+  restart_policy:
+    description: 'Container restart policy'
+    required: false
+    default: 'unless-stopped'
+  skip_health_check:
+    description: 'Skip post-deployment health check'
+    required: false
+    default: 'false'
+  health_endpoint:
+    description: 'Health check endpoint path'
+    required: false
+    default: '/'
+  cleanup_old_images:
+    description: 'Remove old Docker images after deployment'
+    required: false
+    default: 'true'
+  deploy_path:
+    description: 'Deployment path on remote server (default: /opt/docker/{container_name})'
+    required: false
+    default: ''
+  docker_network:
+    description: 'Docker network name (will be created if not exists)'
+    required: false
+    default: 'factory-network'
+
+outputs:
+  deployment_status:
+    description: 'Deployment status: success, failed'
+    value: ${{ steps.deploy.outputs.status }}
+  container_id:
+    description: 'Docker container ID'
+    value: ${{ steps.deploy.outputs.container_id }}
+  health_check_passed:
+    description: 'Health check result'
+    value: ${{ steps.health.outputs.passed }}
+  normalized_image:
+    description: 'Normalized Docker image path (with duplicates removed)'
+    value: ${{ steps.normalize_image.outputs.normalized_image }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Normalize Docker image path
+      id: normalize_image
+      shell: bash
+      run: |
+        DOCKER_IMAGE_RAW="${{ inputs.docker_image }}"
+
+        # Normalize Docker image path to avoid duplicated owner segments
+        # This handles cases like:
+        #   ghcr.io/dm-italy/dm-italy/repo:tag -> ghcr.io/dm-italy/repo:tag
+        #   ghcr.io/owner/owner/path/image:tag -> ghcr.io/owner/path/image:tag
+        normalize_docker_path() {
+          local input_path="$1"
+          local tag=""
+
+          # Extract and preserve tag if present
+          if [[ "$input_path" == *:* ]]; then
+            tag=":${input_path##*:}"
+            input_path="${input_path%:*}"
+          fi
+
+          # Split path by '/' and remove consecutive duplicates
+          IFS='/' read -ra PARTS <<< "$input_path"
+          local NORMALIZED_PARTS=()
+          local PREV_PART=""
+
+          for part in "${PARTS[@]}"; do
+            # Skip if this part is the same as the previous one (duplicate segment)
+            if [ "$part" != "$PREV_PART" ] || [ -z "$PREV_PART" ]; then
+              NORMALIZED_PARTS+=("$part")
+            fi
+            PREV_PART="$part"
+          done
+
+          # Rebuild the normalized path with tag
+          local normalized=$(IFS='/'; echo "${NORMALIZED_PARTS[*]}")
+          echo "${normalized}${tag}"
+        }
+
+        DOCKER_IMAGE=$(normalize_docker_path "$DOCKER_IMAGE_RAW")
+
+        # Output the normalized image
+        echo "normalized_image=$DOCKER_IMAGE" >> $GITHUB_OUTPUT
+
+        # Log if normalization changed the path
+        if [ "$DOCKER_IMAGE" != "$DOCKER_IMAGE_RAW" ]; then
+          echo "⚠️  Docker image path normalized:"
+          echo "   Original:    $DOCKER_IMAGE_RAW"
+          echo "   Normalized:  $DOCKER_IMAGE"
+        else
+          echo "✓ Docker image path: $DOCKER_IMAGE"
+        fi
+
+    - name: Configure SSH key
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ inputs.ssh_key }}" > ~/.ssh/deploy_key_docker
+        chmod 600 ~/.ssh/deploy_key_docker
+        ssh-keyscan -H "${{ inputs.ssh_host }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+    - name: Verify Docker installation
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_docker -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Verifying Docker installation..."
+
+        if ! ssh_exec "command -v docker &> /dev/null"; then
+          echo "❌ Docker is not installed on the target host"
+          echo "Please install Docker: curl -fsSL https://get.docker.com | sh"
+          exit 1
+        fi
+
+        echo "✓ Docker is installed"
+
+        if ! ssh_exec "sudo docker info &> /dev/null"; then
+          echo "❌ Docker daemon is not running"
+          echo "Start Docker: sudo systemctl start docker"
+          exit 1
+        fi
+
+        echo "✓ Docker daemon is running"
+
+        # Display Docker version
+        DOCKER_VERSION=$(ssh_exec "sudo docker version --format '{{.Server.Version}}'" || echo "unknown")
+        echo "Docker version: $DOCKER_VERSION"
+
+    - name: Login to Docker registry
+      if: inputs.registry_username != '' && inputs.registry_password != ''
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        REGISTRY_URL="${{ inputs.registry_url }}"
+        REGISTRY_USER="${{ inputs.registry_username }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_docker -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Logging into Docker registry: $REGISTRY_URL"
+        echo "${{ inputs.registry_password }}" | ssh_exec "sudo docker login $REGISTRY_URL -u $REGISTRY_USER --password-stdin"
+
+        echo "✓ Logged into registry"
+
+    - name: Verify/Create Docker network
+      id: docker_network
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NETWORK_NAME="${{ inputs.docker_network }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_docker -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Checking for Docker network: $NETWORK_NAME"
+
+        if ! ssh_exec "sudo docker network inspect $NETWORK_NAME >/dev/null 2>&1"; then
+          echo "Creating Docker network: $NETWORK_NAME"
+          ssh_exec "sudo docker network create $NETWORK_NAME"
+        fi
+
+        echo "network_name=$NETWORK_NAME" >> $GITHUB_OUTPUT
+        echo "✓ Network ready: $NETWORK_NAME"
+
+    - name: Setup deployment path
+      id: deploy_path
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        CONTAINER_NAME="${{ inputs.container_name }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_docker -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        # Determina deploy path
+        if [ -n "${{ inputs.deploy_path }}" ]; then
+          DEPLOY_PATH="${{ inputs.deploy_path }}"
+        else
+          DEPLOY_PATH="/opt/docker/${CONTAINER_NAME}"
+        fi
+
+        echo "deploy_path=$DEPLOY_PATH" >> $GITHUB_OUTPUT
+        echo "Deployment path: $DEPLOY_PATH"
+
+        # Crea directory se non esiste
+        ssh_exec "sudo mkdir -p $DEPLOY_PATH"
+        echo "✓ Deployment directory ready"
+
+    - name: Stop and remove existing container
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        CONTAINER_NAME="${{ inputs.container_name }}"
+        DEPLOY_PATH="${{ steps.deploy_path.outputs.deploy_path }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_docker -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Stopping existing containers..."
+
+        # Se esiste docker-compose.yml, usa quello per fermare i container
+        if ssh_exec "[ -f '$DEPLOY_PATH/docker-compose.yml' ]"; then
+          echo "Using existing docker-compose.yml to stop containers"
+          ssh_exec "cd $DEPLOY_PATH && sudo docker compose down" || true
+        else
+          # Altrimenti ferma per nome (usa grep per match esatto ed evitare substring match)
+          echo "Stopping containers by name"
+          ssh_exec "sudo docker ps -a --filter name=$CONTAINER_NAME --format '{{.Names}}' | grep \"^$CONTAINER_NAME\$\" | xargs -r sudo docker stop" || true
+          ssh_exec "sudo docker ps -a --filter name=$CONTAINER_NAME --format '{{.Names}}' | grep \"^$CONTAINER_NAME\$\" | xargs -r sudo docker rm" || true
+        fi
+
+        echo "✓ Existing containers stopped"
+
+    - name: Pull Docker image
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        DOCKER_IMAGE="${{ steps.normalize_image.outputs.normalized_image }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_docker -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Pulling Docker image: $DOCKER_IMAGE"
+        ssh_exec "sudo docker pull $DOCKER_IMAGE"
+
+        echo "✓ Image pulled successfully"
+
+    - name: Create docker-compose.yml
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        DOCKER_IMAGE="${{ steps.normalize_image.outputs.normalized_image }}"
+        CONTAINER_NAME="${{ inputs.container_name }}"
+        HOST_PORT="${{ inputs.host_port }}"
+        CONTAINER_PORT="${{ inputs.container_port }}"
+        RESTART_POLICY="${{ inputs.restart_policy }}"
+        DEPLOY_PATH="${{ steps.deploy_path.outputs.deploy_path }}"
+        NETWORK_NAME="${{ steps.docker_network.outputs.network_name }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_docker -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Creating docker-compose.yml..."
+
+        # Crea nome file univoco per evitare conflitti in deployment paralleli
+        COMPOSE_FILE="/tmp/docker-compose-${CONTAINER_NAME}-$$.yml"
+
+        # Usa direttamente l'immagine completa (no tag locale)
+        # Crea il docker-compose.yml completo usando un unico heredoc
+        cat > "$COMPOSE_FILE" <<EOF
+        version: '3.8'
+
+        services:
+          $CONTAINER_NAME:
+            image: $DOCKER_IMAGE
+            container_name: $CONTAINER_NAME
+            restart: $RESTART_POLICY
+            ports:
+              - "$HOST_PORT:$CONTAINER_PORT"
+            environment:
+        EOF
+
+        # Aggiungi environment variables usando Python per parsing JSON robusto
+        cat > /tmp/parse_env.py <<'PYTHON_SCRIPT'
+        import json
+        import sys
+
+        env_json = sys.stdin.read().strip()
+        if env_json and env_json != '{}':
+            env_dict = json.loads(env_json)
+            for key, value in env_dict.items():
+                # Escape delle quote doppie nel valore
+                escaped_value = str(value).replace('"', '\\"')
+                print(f'      {key}: "{escaped_value}"')
+        PYTHON_SCRIPT
+
+        echo '${{ inputs.environment_vars }}' | python3 /tmp/parse_env.py >> "$COMPOSE_FILE"
+        rm -f /tmp/parse_env.py
+
+        # Aggiungi volumi usando Python per parsing JSON robusto
+        cat > /tmp/parse_volumes.py <<'PYTHON_SCRIPT'
+        import json
+        import sys
+
+        volumes_json = sys.stdin.read().strip()
+        if volumes_json and volumes_json != '[]':
+            volumes_list = json.loads(volumes_json)
+            print('    volumes:')
+            for volume in volumes_list:
+                print(f'      - {volume}')
+        PYTHON_SCRIPT
+
+        echo '${{ inputs.volume_mounts }}' | python3 /tmp/parse_volumes.py >> "$COMPOSE_FILE"
+        rm -f /tmp/parse_volumes.py
+
+        # Aggiungi rete e healthcheck
+        # NOTA: Non usiamo CMD healthcheck interno perché curl/wget potrebbero non essere disponibili
+        # nelle immagini .NET base. L'health check viene fatto esternamente dal workflow.
+        cat >> "$COMPOSE_FILE" <<EOF
+            networks:
+              - $NETWORK_NAME
+
+        networks:
+          $NETWORK_NAME:
+            external: true
+        EOF
+
+        echo "✓ docker-compose.yml created"
+
+        # Mostra il file per debugging (nascondendo valori sensibili)
+        echo "Docker Compose configuration:"
+        cat "$COMPOSE_FILE" | sed 's/Password[^"]*/"***/g; s/ConnectionString[^"]*/"***/g'
+
+        # Crea nome univoco anche sul server remoto
+        REMOTE_COMPOSE="/tmp/docker-compose-${CONTAINER_NAME}-$$.yml"
+
+        # Trasferisci al server
+        scp -i ~/.ssh/deploy_key_docker -o StrictHostKeyChecking=no \
+            "$COMPOSE_FILE" "$SSH_USER@$SSH_HOST:$REMOTE_COMPOSE"
+
+        # Sposta in directory di deploy
+        ssh_exec "sudo mv $REMOTE_COMPOSE $DEPLOY_PATH/docker-compose.yml"
+
+        # Cleanup locale
+        rm -f "$COMPOSE_FILE"
+
+        echo "✓ docker-compose.yml deployed to $DEPLOY_PATH"
+
+    - name: Start containers with docker-compose
+      id: deploy
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        DOCKER_IMAGE="${{ inputs.docker_image }}"
+        CONTAINER_NAME="${{ inputs.container_name }}"
+        DEPLOY_PATH="${{ steps.deploy_path.outputs.deploy_path }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_docker -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Starting containers with docker-compose..."
+
+        # Avvia con docker-compose (usa immagine completa, no tag locale)
+        if ssh_exec "cd $DEPLOY_PATH && sudo docker compose up -d"; then
+          echo "✓ Containers started"
+
+          # Attendi avvio
+          sleep 10
+
+          # Verifica container running (usa head -1 per evitare match multipli con substring)
+          CONTAINER_STATUS=$(ssh_exec "sudo docker ps --filter name=$CONTAINER_NAME --format '{{.Status}}' | head -1" || echo "")
+
+          if echo "$CONTAINER_STATUS" | grep -q "Up"; then
+            echo "✓ Container running: $CONTAINER_STATUS"
+            echo "status=success" >> $GITHUB_OUTPUT
+
+            # Ottieni container ID (usa head -1 per evitare match multipli)
+            CONTAINER_ID=$(ssh_exec "sudo docker ps --filter name=$CONTAINER_NAME --format '{{.ID}}' | head -1" || echo "")
+            echo "container_id=$CONTAINER_ID" >> $GITHUB_OUTPUT
+
+            # Mostra dettagli essenziali del container (usa head -1 per evitare match multipli)
+            echo "Container details:"
+            echo "  ID: $CONTAINER_ID"
+            echo "  Status: $CONTAINER_STATUS"
+            ssh_exec "sudo docker ps --filter name=$CONTAINER_NAME --format 'Name: {{.Names}}, Image: {{.Image}}, Ports: {{.Ports}}' | head -1" || true
+          else
+            echo "❌ Container failed to start"
+            echo "Status: $CONTAINER_STATUS"
+            echo "status=failed" >> $GITHUB_OUTPUT
+
+            # Mostra log
+            echo "Container logs:"
+            ssh_exec "sudo docker logs $CONTAINER_NAME --tail 50" || true
+            exit 1
+          fi
+        else
+          echo "❌ Failed to start containers"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: Health check
+      id: health
+      if: inputs.skip_health_check != 'true'
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        HOST_PORT="${{ inputs.host_port }}"
+        HEALTH_ENDPOINT="${{ inputs.health_endpoint }}"
+        CONTAINER_NAME="${{ inputs.container_name }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_docker -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Performing health check..."
+        echo "Endpoint: http://localhost:$HOST_PORT$HEALTH_ENDPOINT"
+
+        # Wait for application to be ready
+        sleep 10
+
+        # Retry logic for health check
+        MAX_RETRIES=6
+        RETRY_DELAY=5
+        RETRY_COUNT=0
+
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+          echo "Health check attempt $((RETRY_COUNT + 1))/$MAX_RETRIES..."
+
+          HTTP_CODE=$(ssh_exec "curl -s -o /dev/null -w '%{http_code}' http://localhost:$HOST_PORT$HEALTH_ENDPOINT" || echo "000")
+
+          # Accetta 200, 301, 302 come successo (il servizio è attivo e risponde)
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "301" ] || [ "$HTTP_CODE" = "302" ]; then
+            echo "✓ Health check passed (HTTP $HTTP_CODE)"
+            echo "passed=true" >> $GITHUB_OUTPUT
+
+            # Get health check response if available
+            HEALTH_RESPONSE=$(ssh_exec "curl -s -L http://localhost:$HOST_PORT$HEALTH_ENDPOINT" || echo "")
+            if [ -n "$HEALTH_RESPONSE" ]; then
+              echo "Health response (first 500 chars): ${HEALTH_RESPONSE:0:500}"
+            fi
+
+            exit 0
+
+          else
+            echo "Health check returned HTTP $HTTP_CODE"
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "Waiting $RETRY_DELAY seconds before retry..."
+              sleep $RETRY_DELAY
+            fi
+          fi
+        done
+
+        echo "❌ Health check failed after $MAX_RETRIES attempts"
+        echo "passed=false" >> $GITHUB_OUTPUT
+
+        # Show container logs for debugging
+        echo "Recent container logs:"
+        ssh_exec "sudo docker logs --tail 100 $CONTAINER_NAME" || true
+
+        # Show container stats
+        echo "Container stats:"
+        ssh_exec "sudo docker stats --no-stream $CONTAINER_NAME" || true
+
+        exit 1
+
+    - name: Cleanup old images
+      if: inputs.cleanup_old_images == 'true'
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        DOCKER_IMAGE="${{ steps.normalize_image.outputs.normalized_image }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_docker -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Cleaning up old Docker images..."
+
+        # Extract repository name without tag
+        IMAGE_REPO=$(echo "$DOCKER_IMAGE" | cut -d':' -f1)
+
+        # Remove dangling images
+        ssh_exec "sudo docker images -f dangling=true -q | xargs -r sudo docker rmi" || true
+
+        # Remove old versions of this image (keep current)
+        ssh_exec "sudo docker images $IMAGE_REPO --format '{{.ID}} {{.Tag}}' | grep -v '$(echo $DOCKER_IMAGE | cut -d':' -f2)' | awk '{print \$1}' | xargs -r sudo docker rmi" || true
+
+        echo "✓ Cleanup completed"
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        rm -f ~/.ssh/deploy_key_docker
+        echo "✓ Cleaned up SSH keys"

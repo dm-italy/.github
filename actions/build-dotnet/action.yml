@@ -1,0 +1,294 @@
+name: 'Build .NET Project'
+description: 'Build .NET project with NuGet sources configuration, ABP support, and artifact creation'
+author: 'DiemmeGroup DevOps'
+
+inputs:
+  dotnet_version:
+    description: '.NET SDK version'
+    required: false
+    default: '8.0.x'
+  node_version:
+    description: 'Node.js version (for ABP frontend)'
+    required: false
+    default: '16.x'
+  project_path:
+    description: 'Path to the project directory containing package.json (if exists)'
+    required: true
+  csproj_pattern:
+    description: 'Path or pattern to .csproj file to build'
+    required: true
+  build_configuration:
+    description: 'Build configuration (Release/Debug)'
+    required: false
+    default: 'Release'
+  version:
+    description: 'Version to set in common.props'
+    required: true
+  artifact_name:
+    description: 'Name for the build artifact'
+    required: true
+  skip_tests:
+    description: 'Skip running tests'
+    required: false
+    default: 'true'
+  test_projects_pattern:
+    description: 'Pattern for test projects (e.g., services/factory/test/**/*.csproj)'
+    required: false
+    default: ''
+  install_abp_cli:
+    description: 'Install ABP CLI and run install-libs'
+    required: false
+    default: 'false'
+  nuget_feed_username:
+    description: 'GitHub Packages username'
+    required: true
+  nuget_feed_password:
+    description: 'GitHub Packages PAT token'
+    required: true
+  abp_nuget_api_key:
+    description: 'ABP Commercial NuGet API key'
+    required: true
+  devexpress_nuget_key:
+    description: 'DevExpress NuGet API key'
+    required: true
+  telerik_username:
+    description: 'Telerik username'
+    required: true
+  telerik_password:
+    description: 'Telerik password'
+    required: true
+
+outputs:
+  artifact_name:
+    description: 'Name of the created artifact'
+    value: ${{ steps.artifact-info.outputs.artifact_name }}
+  publish_path:
+    description: 'Path to published files'
+    value: ${{ github.workspace }}/publish
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Git
+      shell: bash
+      run: |
+        git config --global user.email "gitbot@dmconsulting.it"
+        git config --global user.name "gitbot"
+
+    - name: Update common.props version
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version }}"
+        echo "Updating common.props with version: $VERSION"
+
+        if [ -f "common.props" ]; then
+          sed -i "s|<Version>[0-9][0-9.]*</Version>|<Version>$VERSION</Version>|g" common.props
+          echo "✓ Updated common.props:"
+          grep -n "<Version>" common.props
+        else
+          echo "⚠️ common.props not found - skipping version update"
+        fi
+
+    - name: Check for package.json
+      id: check-npm
+      shell: bash
+      working-directory: ${{ inputs.project_path }}
+      run: |
+        if [ -f "package.json" ]; then
+          echo "has-npm=true" >> $GITHUB_OUTPUT
+          echo "✓ package.json found"
+        else
+          echo "has-npm=false" >> $GITHUB_OUTPUT
+          echo "ℹ No package.json found"
+        fi
+
+    - name: Setup Node.js
+      if: steps.check-npm.outputs.has-npm == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: Install npm dependencies
+      if: steps.check-npm.outputs.has-npm == 'true'
+      shell: bash
+      working-directory: ${{ inputs.project_path }}
+      run: |
+        echo "Installing npm dependencies..."
+        npm install
+        echo "✓ npm dependencies installed"
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ inputs.dotnet_version }}
+      env:
+        DOTNET_INSTALL_DIR: ${{ github.workspace }}/.dotnet
+
+    - name: Add .NET to PATH
+      shell: bash
+      run: |
+        echo "${{ github.workspace }}/.dotnet" >> $GITHUB_PATH
+        echo "DOTNET_ROOT=${{ github.workspace }}/.dotnet" >> $GITHUB_ENV
+
+    - name: Configure NuGet sources with credentials
+      shell: bash
+      run: |
+        echo "Configuring NuGet sources..."
+
+        # Remove all existing sources (to avoid duplicates)
+        dotnet nuget list source --configfile NuGet.Config 2>/dev/null | grep -v "Registered Sources:" | grep -v "^$" | while read line; do
+          SOURCE_NAME=$(echo "$line" | awk '{print $2}')
+          if [ ! -z "$SOURCE_NAME" ] && [ "$SOURCE_NAME" != "nuget.org" ]; then
+            dotnet nuget remove source "$SOURCE_NAME" --configfile NuGet.Config 2>/dev/null || true
+          fi
+        done
+
+        # 1. nuget.org (public, already present)
+        echo "✓ nuget.org (already configured)"
+
+        # 2. ABP Commercial NuGet Source
+        dotnet nuget add source "https://nuget.abp.io/3a2de83c-09eb-49b1-863f-0dc280eb8320/v3/index.json" \
+          --name "ABP Commercial NuGet Source" \
+          --username "abp" \
+          --password "${{ inputs.abp_nuget_api_key }}" \
+          --store-password-in-clear-text \
+          --configfile NuGet.Config
+        echo "✓ ABP Commercial NuGet Source configured"
+
+        # 3. GitHub Packages - DmItalyGit
+        dotnet nuget add source "https://nuget.pkg.github.com/dm-italy/index.json" \
+          --name "DmItalyGit" \
+          --username "${{ inputs.nuget_feed_username }}" \
+          --password "${{ inputs.nuget_feed_password }}" \
+          --store-password-in-clear-text \
+          --configfile NuGet.Config
+        echo "✓ DmItalyGit configured"
+
+        # 4. Telerik
+        dotnet nuget add source "https://nuget.telerik.com/v3/index.json" \
+          --name "Telerik" \
+          --username "${{ inputs.telerik_username }}" \
+          --password "${{ inputs.telerik_password }}" \
+          --store-password-in-clear-text \
+          --configfile NuGet.Config
+        echo "✓ Telerik configured"
+
+        # 5. DevExpress
+        dotnet nuget add source "https://nuget.devexpress.com/${{ inputs.devexpress_nuget_key }}/api" \
+          --name "DevExpress" \
+          --configfile NuGet.Config
+        echo "✓ DevExpress configured"
+
+        echo ""
+        echo "✓ All NuGet sources configured with credentials"
+        echo ""
+        echo "Configured sources:"
+        dotnet nuget list source --configfile NuGet.Config
+
+    - name: Install ABP CLI
+      if: inputs.install_abp_cli == 'true'
+      shell: bash
+      run: |
+        echo "Checking ABP Studio CLI installation..."
+        if dotnet tool list -g | grep -q "volo.abp.studio.cli"; then
+          echo "✓ ABP Studio CLI is already installed"
+          dotnet tool list -g | grep "volo.abp.studio.cli"
+        else
+          echo "Installing ABP Studio CLI..."
+          dotnet tool install -g Volo.Abp.Studio.Cli
+          echo "✓ ABP Studio CLI installed successfully"
+        fi
+
+        # Ensure .NET tools are in PATH
+        export PATH="$PATH:$HOME/.dotnet/tools"
+        echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+        # Verify abp command is available
+        if command -v abp &> /dev/null; then
+          echo "✓ ABP CLI is available"
+          abp --version
+        else
+          echo "⚠️ ABP CLI not found in PATH"
+        fi
+
+    - name: Install ABP libraries (JS/CSS to wwwroot)
+      if: inputs.install_abp_cli == 'true'
+      shell: bash
+      working-directory: ${{ inputs.project_path }}
+      run: |
+        echo "Running abp install-libs to restore JS/CSS libraries to wwwroot..."
+        abp install-libs
+        echo "✓ ABP libraries installed"
+
+    - name: Restore NuGet packages
+      shell: bash
+      run: |
+        echo "Restoring NuGet packages..."
+        if [ -f "NuGet.Config" ]; then
+          dotnet restore ${{ inputs.csproj_pattern }} --configfile NuGet.Config --verbosity minimal
+        else
+          dotnet restore ${{ inputs.csproj_pattern }} --verbosity minimal
+        fi
+        echo "✓ NuGet packages restored"
+
+    - name: Build solution
+      shell: bash
+      run: |
+        echo "Building solution..."
+        dotnet build ${{ inputs.csproj_pattern }} \
+          --configuration ${{ inputs.build_configuration }} \
+          --no-restore \
+          --verbosity minimal
+        echo "✓ Build completed"
+
+    - name: Run tests
+      if: inputs.skip_tests != 'true' && inputs.test_projects_pattern != ''
+      shell: bash
+      run: |
+        echo "Running tests..."
+        dotnet test ${{ inputs.test_projects_pattern }} \
+          --configuration ${{ inputs.build_configuration }} \
+          --no-build \
+          --verbosity minimal \
+          --logger trx \
+          --collect:"XPlat Code Coverage"
+        echo "✓ Tests completed"
+      continue-on-error: true
+
+    - name: Publish .NET project
+      shell: bash
+      run: |
+        echo "Publishing project..."
+        dotnet publish ${{ inputs.csproj_pattern }} \
+          --configuration ${{ inputs.build_configuration }} \
+          --output ${{ github.workspace }}/publish \
+          --no-build \
+          --verbosity minimal
+        echo "✓ Project published"
+
+        echo "Published files:"
+        ls -lh ${{ github.workspace }}/publish/ | head -20 || true
+
+    - name: Prepare artifact info
+      id: artifact-info
+      shell: bash
+      run: |
+        ARTIFACT_NAME="${{ inputs.artifact_name }}"
+        echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+        echo "Artifact name: $ARTIFACT_NAME"
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.artifact-info.outputs.artifact_name }}
+        path: ${{ github.workspace }}/publish
+        retention-days: 30
+        compression-level: 6
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        echo "Cleaning up..."
+        rm -rf ${{ github.workspace }}/publish
+        echo "✓ Cleanup completed"

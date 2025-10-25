@@ -1,0 +1,269 @@
+name: 'Create GitHub Release'
+description: 'Create GitHub release with artifacts, changelog, and Docker image references'
+author: 'DiemmeGroup DevOps'
+
+inputs:
+  github_token:
+    description: 'GitHub token for creating releases'
+    required: true
+  tag_name:
+    description: 'Release tag name (e.g., v1.0.0)'
+    required: true
+  release_name:
+    description: 'Release name (defaults to tag name)'
+    required: false
+    default: ''
+  body:
+    description: 'Release body/description (markdown supported)'
+    required: false
+    default: ''
+  draft:
+    description: 'Create as draft release'
+    required: false
+    default: 'false'
+  prerelease:
+    description: 'Mark as prerelease'
+    required: false
+    default: 'false'
+  generate_release_notes:
+    description: 'Auto-generate release notes from commits'
+    required: false
+    default: 'true'
+  artifacts:
+    description: 'Comma-separated list of artifact names to attach'
+    required: false
+    default: ''
+  docker_images:
+    description: 'JSON array of Docker image references to include in release notes'
+    required: false
+    default: '[]'
+  previous_tag:
+    description: 'Previous tag for comparison in release notes'
+    required: false
+    default: ''
+
+outputs:
+  release_id:
+    description: 'Created release ID'
+    value: ${{ steps.create.outputs.id }}
+  release_url:
+    description: 'URL of the created release'
+    value: ${{ steps.create.outputs.html_url }}
+  release_upload_url:
+    description: 'Upload URL for release assets'
+    value: ${{ steps.create.outputs.upload_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Prepare release metadata
+      id: prepare
+      shell: bash
+      run: |
+        TAG_NAME="${{ inputs.tag_name }}"
+        RELEASE_NAME="${{ inputs.release_name }}"
+        BODY="${{ inputs.body }}"
+
+        # Use tag name as release name if not provided
+        if [ -z "$RELEASE_NAME" ]; then
+          RELEASE_NAME="$TAG_NAME"
+        fi
+
+        echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+        echo "Release name: $RELEASE_NAME"
+
+        # Prepare release body
+        RELEASE_BODY=""
+
+        # Add custom body if provided
+        if [ -n "$BODY" ]; then
+          RELEASE_BODY="$BODY"
+        fi
+
+        # Add Docker images section if provided
+        DOCKER_IMAGES='${{ inputs.docker_images }}'
+        if [ "$DOCKER_IMAGES" != "[]" ]; then
+          if [ -n "$RELEASE_BODY" ]; then
+            RELEASE_BODY="$RELEASE_BODY\n\n"
+          fi
+
+          RELEASE_BODY="${RELEASE_BODY}## 🐳 Docker Images\n\n"
+
+          # Parse JSON array and add each image
+          echo "$DOCKER_IMAGES" | jq -r '.[]' | while read -r image; do
+            RELEASE_BODY="${RELEASE_BODY}- \`$image\`\n"
+          done
+
+          RELEASE_BODY="${RELEASE_BODY}\n**Pull command:**\n\`\`\`bash\n"
+          FIRST_IMAGE=$(echo "$DOCKER_IMAGES" | jq -r '.[0]')
+          RELEASE_BODY="${RELEASE_BODY}docker pull $FIRST_IMAGE\n\`\`\`"
+        fi
+
+        # Add comparison link if previous tag provided
+        if [ -n "${{ inputs.previous_tag }}" ]; then
+          if [ -n "$RELEASE_BODY" ]; then
+            RELEASE_BODY="$RELEASE_BODY\n\n"
+          fi
+          RELEASE_BODY="${RELEASE_BODY}**Full Changelog**: "
+          RELEASE_BODY="${RELEASE_BODY}[${{ inputs.previous_tag }}...$TAG_NAME]"
+          RELEASE_BODY="${RELEASE_BODY}(${{ github.server_url }}/${{ github.repository }}/compare/${{ inputs.previous_tag }}...$TAG_NAME)"
+        fi
+
+        # Save to output (escape newlines for GitHub Actions)
+        {
+          echo "release_body<<EOF"
+          echo -e "$RELEASE_BODY"
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
+
+        echo "✓ Release metadata prepared"
+
+    - name: Download artifacts
+      if: inputs.artifacts != ''
+      uses: actions/download-artifact@v4
+      with:
+        path: ./release-artifacts
+
+    - name: Prepare artifact list
+      if: inputs.artifacts != ''
+      id: artifacts
+      shell: bash
+      run: |
+        ARTIFACTS="${{ inputs.artifacts }}"
+
+        echo "Preparing artifacts for upload..."
+
+        # Create list of artifact files
+        ARTIFACT_FILES=""
+        IFS=',' read -ra ARTIFACT_ARRAY <<< "$ARTIFACTS"
+
+        for artifact_name in "${ARTIFACT_ARRAY[@]}"; do
+          artifact_name=$(echo "$artifact_name" | xargs)  # Trim whitespace
+
+          if [ -d "./release-artifacts/$artifact_name" ]; then
+            echo "Found artifact directory: $artifact_name"
+
+            # Create zip archive for each artifact
+            cd "./release-artifacts/$artifact_name"
+            zip -r "../../${artifact_name}.zip" .
+            cd ../..
+
+            if [ -n "$ARTIFACT_FILES" ]; then
+              ARTIFACT_FILES="$ARTIFACT_FILES,"
+            fi
+            ARTIFACT_FILES="$ARTIFACT_FILES${artifact_name}.zip"
+
+            echo "  → Created ${artifact_name}.zip"
+          else
+            echo "⚠️ Artifact directory not found: $artifact_name"
+          fi
+        done
+
+        echo "artifact_files=$ARTIFACT_FILES" >> $GITHUB_OUTPUT
+        echo "✓ Artifacts prepared"
+
+    - name: Create GitHub Release
+      id: create
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      with:
+        tag_name: ${{ inputs.tag_name }}
+        release_name: ${{ steps.prepare.outputs.release_name }}
+        body: ${{ steps.prepare.outputs.release_body }}
+        draft: ${{ inputs.draft }}
+        prerelease: ${{ inputs.prerelease }}
+
+    - name: Upload release artifacts
+      if: inputs.artifacts != '' && steps.artifacts.outputs.artifact_files != ''
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: |
+        UPLOAD_URL="${{ steps.create.outputs.upload_url }}"
+        ARTIFACT_FILES="${{ steps.artifacts.outputs.artifact_files }}"
+
+        echo "Uploading artifacts to release..."
+
+        IFS=',' read -ra FILE_ARRAY <<< "$ARTIFACT_FILES"
+
+        for file in "${FILE_ARRAY[@]}"; do
+          file=$(echo "$file" | xargs)  # Trim whitespace
+
+          if [ -f "$file" ]; then
+            echo "Uploading: $file"
+
+            # Upload using GitHub CLI
+            gh release upload "${{ inputs.tag_name }}" "$file" \
+              --repo "${{ github.repository }}" \
+              --clobber
+
+            echo "  ✓ Uploaded: $file"
+          else
+            echo "  ⚠️ File not found: $file"
+          fi
+        done
+
+        echo "✓ All artifacts uploaded"
+
+    - name: Generate release summary
+      shell: bash
+      run: |
+        echo ""
+        echo "## 🎉 GitHub Release Created" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Tag:** \`${{ inputs.tag_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Release Name:** ${{ steps.prepare.outputs.release_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Release URL:** ${{ steps.create.outputs.html_url }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.draft }}" = "true" ]; then
+          echo "📝 **Status:** Draft" >> $GITHUB_STEP_SUMMARY
+        elif [ "${{ inputs.prerelease }}" = "true" ]; then
+          echo "🚧 **Status:** Pre-release" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "✅ **Status:** Published" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Add artifacts info if present
+        if [ -n "${{ inputs.artifacts }}" ]; then
+          echo "### 📦 Attached Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          IFS=',' read -ra ARTIFACT_ARRAY <<< "${{ inputs.artifacts }}"
+          for artifact in "${ARTIFACT_ARRAY[@]}"; do
+            artifact=$(echo "$artifact" | xargs)
+            echo "- \`${artifact}.zip\`" >> $GITHUB_STEP_SUMMARY
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Add Docker images if present
+        DOCKER_IMAGES='${{ inputs.docker_images }}'
+        if [ "$DOCKER_IMAGES" != "[]" ]; then
+          echo "### 🐳 Docker Images" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "$DOCKER_IMAGES" | jq -r '.[]' | while read -r image; do
+            echo "- \`$image\`" >> $GITHUB_STEP_SUMMARY
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "View release: [${{ inputs.tag_name }}](${{ steps.create.outputs.html_url }})" >> $GITHUB_STEP_SUMMARY
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        # Cleanup downloaded artifacts
+        rm -rf ./release-artifacts
+        rm -f *.zip
+
+        echo "✓ Release creation completed"

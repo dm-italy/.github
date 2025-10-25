@@ -1,0 +1,49 @@
+name: Version and Release
+
+on:
+  push:
+    branches: [main, update]
+  workflow_dispatch:
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.versioning.outputs.new_version }}
+      version_changed: ${{ steps.versioning.outputs.version_changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for conventional commits
+
+      - name: Semantic Versioning
+        id: versioning
+        uses: dm-italy/.github/actions/version-management@main
+        with:
+          working_directory: '.'  # ⬅️ Customize: project directory
+          tag_prefix: 'my-service@'  # ⬅️ Customize: tag prefix (e.g., factory-app@)
+          cleanup_unpushed_tags: 'true'
+          git_branch: 'update'  # ⬅️ Customize: your branch
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    needs: version
+    if: needs.version.outputs.version_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release
+        uses: dm-italy/.github/actions/create-github-release@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: 'my-service@${{ needs.version.outputs.new_version }}'  # ⬅️ Match tag_prefix
+          release_name: 'My Service v${{ needs.version.outputs.new_version }}'  # ⬅️ Customize
+          generate_release_notes: 'true'
+          draft: 'false'
+          prerelease: 'false'
+          docker_images: |
+            [
+              "ghcr.io/dm-italy/my-service:${{ needs.version.outputs.new_version }}",
+              "ghcr.io/dm-italy/my-service:latest"
+            ]

@@ -1,0 +1,7 @@
+{
+  "name": "Semantic Versioning and Release",
+  "description": "Automatic semantic versioning with changelog generation and GitHub release creation",
+  "iconName": "package",
+  "categories": ["Release", "Versioning", "Changelog"],
+  "filePatterns": ["**/package.json", "**/CHANGELOG.md"]
+}

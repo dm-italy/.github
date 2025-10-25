@@ -1,0 +1,7 @@
+{
+  "name": "Deploy Docker Service",
+  "description": "Build Docker image and deploy as container with Nginx reverse proxy",
+  "iconName": "docker",
+  "categories": ["Deployment", "Docker", "Containers"],
+  "filePatterns": ["**/Dockerfile", "**/.dockerignore"]
+}

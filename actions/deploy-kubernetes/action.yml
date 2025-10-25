@@ -1,0 +1,937 @@
+name: 'Deploy to Kubernetes Cluster'
+description: 'Deploy Docker image to Kubernetes cluster with advanced configuration, health checks, and rollback support'
+author: 'DiemmeGroup DevOps'
+
+inputs:
+  ssh_key:
+    description: 'SSH private key for authentication to kubectl node'
+    required: true
+  ssh_host:
+    description: 'Target host with kubectl access (control plane or node with kubeconfig)'
+    required: true
+  ssh_user:
+    description: 'SSH username for deployment'
+    required: true
+  kubeconfig:
+    description: 'Kubernetes config content (base64 encoded) - Optional if kubectl already configured on host'
+    required: false
+    default: ''
+  kubectl_context:
+    description: 'Kubectl context to use (optional, uses current-context if not specified)'
+    required: false
+    default: ''
+  namespace:
+    description: 'Kubernetes namespace for deployment'
+    required: true
+  docker_image:
+    description: 'Full Docker image reference (e.g., ghcr.io/org/image:tag)'
+    required: true
+  app_name:
+    description: 'Application name (used for deployment, service, labels)'
+    required: true
+  replicas:
+    description: 'Number of pod replicas'
+    required: false
+    default: '1'
+  container_port:
+    description: 'Container internal port'
+    required: true
+  service_port:
+    description: 'Service port (external)'
+    required: false
+    default: '80'
+  service_type:
+    description: 'Kubernetes service type'
+    required: false
+    default: 'ClusterIP'
+  environment_vars:
+    description: 'Environment variables as JSON object (e.g., {"KEY":"value"}) - Stored in ConfigMap'
+    required: false
+    default: '{}'
+  secrets:
+    description: 'Secret values as JSON object (e.g., {"DB_PASSWORD":"secret"}) - Stored in K8s Secret'
+    required: false
+    default: '{}'
+  ingress_enabled:
+    description: 'Enable Ingress resource creation'
+    required: false
+    default: 'false'
+  ingress_host:
+    description: 'Ingress hostname (required if ingress_enabled=true)'
+    required: false
+    default: ''
+  ingress_class:
+    description: 'Ingress class name (e.g., nginx, traefik)'
+    required: false
+    default: 'nginx'
+  ingress_tls_enabled:
+    description: 'Enable TLS for Ingress'
+    required: false
+    default: 'false'
+  ingress_tls_secret:
+    description: 'TLS secret name for Ingress'
+    required: false
+    default: ''
+  cpu_request:
+    description: 'CPU request (e.g., 100m, 0.5)'
+    required: false
+    default: '100m'
+  cpu_limit:
+    description: 'CPU limit (e.g., 500m, 1)'
+    required: false
+    default: '500m'
+  memory_request:
+    description: 'Memory request (e.g., 128Mi, 256Mi)'
+    required: false
+    default: '256Mi'
+  memory_limit:
+    description: 'Memory limit (e.g., 512Mi, 1Gi)'
+    required: false
+    default: '512Mi'
+  volume_mounts:
+    description: 'Volume mounts as JSON array (e.g., [{"name":"data","mountPath":"/app/data","subPath":""}])'
+    required: false
+    default: '[]'
+  persistent_volumes:
+    description: 'PersistentVolumeClaim definitions as JSON array (e.g., [{"name":"data","size":"1Gi","storageClass":"standard"}])'
+    required: false
+    default: '[]'
+  health_check_path:
+    description: 'HTTP health check endpoint path'
+    required: false
+    default: '/'
+  liveness_probe_enabled:
+    description: 'Enable liveness probe'
+    required: false
+    default: 'true'
+  readiness_probe_enabled:
+    description: 'Enable readiness probe'
+    required: false
+    default: 'true'
+  skip_health_check:
+    description: 'Skip post-deployment health check'
+    required: false
+    default: 'false'
+  rollback_on_failure:
+    description: 'Rollback to previous revision on deployment failure'
+    required: false
+    default: 'true'
+  image_pull_secret:
+    description: 'Name of imagePullSecret for private registries'
+    required: false
+    default: ''
+  registry_url:
+    description: 'Docker registry URL for creating imagePullSecret'
+    required: false
+    default: ''
+  registry_username:
+    description: 'Docker registry username for creating imagePullSecret'
+    required: false
+    default: ''
+  registry_password:
+    description: 'Docker registry password for creating imagePullSecret'
+    required: false
+    default: ''
+  labels:
+    description: 'Additional labels as JSON object (e.g., {"team":"backend","tier":"api"})'
+    required: false
+    default: '{}'
+  annotations:
+    description: 'Additional annotations as JSON object'
+    required: false
+    default: '{}'
+
+outputs:
+  deployment_status:
+    description: 'Deployment status: success, failed, rolled_back'
+    value: ${{ steps.deploy.outputs.status }}
+  rollout_status:
+    description: 'Rollout status message'
+    value: ${{ steps.rollout.outputs.status }}
+  service_endpoint:
+    description: 'Service endpoint (for LoadBalancer or NodePort)'
+    value: ${{ steps.service_info.outputs.endpoint }}
+  health_check_passed:
+    description: 'Health check result'
+    value: ${{ steps.health.outputs.passed }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure SSH key
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ inputs.ssh_key }}" > ~/.ssh/deploy_key_k8s
+        chmod 600 ~/.ssh/deploy_key_k8s
+        ssh-keyscan -H "${{ inputs.ssh_host }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+    - name: Verify kubectl installation
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Verifying kubectl installation..."
+
+        if ! ssh_exec "command -v kubectl &> /dev/null"; then
+          echo "❌ kubectl is not installed on the target host"
+          echo "Please install kubectl: https://kubernetes.io/docs/tasks/tools/"
+          exit 1
+        fi
+
+        echo "✓ kubectl is installed"
+
+        # Display kubectl version
+        KUBECTL_VERSION=$(ssh_exec "kubectl version --client --short 2>/dev/null || kubectl version --client" | head -1 || echo "unknown")
+        echo "kubectl version: $KUBECTL_VERSION"
+
+        # Verify cluster connectivity
+        if ! ssh_exec "kubectl cluster-info &> /dev/null"; then
+          echo "⚠️  Warning: Cannot connect to Kubernetes cluster. Will attempt to configure kubeconfig."
+        else
+          echo "✓ Cluster connectivity verified"
+        fi
+
+    - name: Setup kubeconfig
+      if: inputs.kubeconfig != ''
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Configuring kubeconfig..."
+
+        # Decode and transfer kubeconfig
+        echo "${{ inputs.kubeconfig }}" | base64 -d > /tmp/kubeconfig
+
+        # Transfer to remote host
+        scp -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no \
+            /tmp/kubeconfig "$SSH_USER@$SSH_HOST:/tmp/kubeconfig"
+
+        # Setup on remote
+        ssh_exec "mkdir -p ~/.kube"
+        ssh_exec "mv /tmp/kubeconfig ~/.kube/config"
+        ssh_exec "chmod 600 ~/.kube/config"
+
+        # Cleanup local
+        rm -f /tmp/kubeconfig
+
+        echo "✓ Kubeconfig configured"
+
+    - name: Set kubectl context
+      if: inputs.kubectl_context != ''
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        CONTEXT="${{ inputs.kubectl_context }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Setting kubectl context to: $CONTEXT"
+        ssh_exec "kubectl config use-context $CONTEXT"
+
+        echo "✓ Context set"
+
+    - name: Create/Verify namespace
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NAMESPACE="${{ inputs.namespace }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Checking namespace: $NAMESPACE"
+
+        if ! ssh_exec "kubectl get namespace $NAMESPACE &> /dev/null"; then
+          echo "Creating namespace: $NAMESPACE"
+          ssh_exec "kubectl create namespace $NAMESPACE"
+        else
+          echo "✓ Namespace exists"
+        fi
+
+    - name: Create imagePullSecret
+      if: inputs.registry_url != '' && inputs.registry_username != '' && inputs.registry_password != ''
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NAMESPACE="${{ inputs.namespace }}"
+        APP_NAME="${{ inputs.app_name }}"
+        REGISTRY_URL="${{ inputs.registry_url }}"
+        REGISTRY_USER="${{ inputs.registry_username }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        SECRET_NAME="${APP_NAME}-registry-secret"
+
+        echo "Creating imagePullSecret: $SECRET_NAME"
+
+        # Delete existing secret if present
+        ssh_exec "kubectl delete secret $SECRET_NAME -n $NAMESPACE --ignore-not-found=true"
+
+        # Create new secret
+        ssh_exec "kubectl create secret docker-registry $SECRET_NAME \
+          --docker-server=$REGISTRY_URL \
+          --docker-username=$REGISTRY_USER \
+          --docker-password='${{ inputs.registry_password }}' \
+          -n $NAMESPACE"
+
+        echo "✓ imagePullSecret created"
+
+    - name: Create/Update ConfigMap
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NAMESPACE="${{ inputs.namespace }}"
+        APP_NAME="${{ inputs.app_name }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Creating ConfigMap for environment variables..."
+
+        # Parse environment variables JSON and create configmap data
+        cat > /tmp/parse_configmap.py <<'PYTHON_SCRIPT'
+        import json
+        import sys
+        import yaml
+
+        env_json = sys.stdin.read().strip()
+        if env_json and env_json != '{}':
+            env_dict = json.loads(env_json)
+            # Convert to YAML key-value format
+            data = {str(k): str(v) for k, v in env_dict.items()}
+            print(yaml.dump({'data': data}, default_flow_style=False))
+        else:
+            print('data: {}')
+        PYTHON_SCRIPT
+
+        CONFIGMAP_DATA=$(echo '${{ inputs.environment_vars }}' | python3 /tmp/parse_configmap.py)
+        rm -f /tmp/parse_configmap.py
+
+        # Create ConfigMap YAML
+        cat > /tmp/configmap.yml <<EOF
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${APP_NAME}-config
+          namespace: ${NAMESPACE}
+        ${CONFIGMAP_DATA}
+        EOF
+
+        # Transfer and apply
+        scp -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no \
+            /tmp/configmap.yml "$SSH_USER@$SSH_HOST:/tmp/configmap.yml"
+
+        ssh_exec "kubectl apply -f /tmp/configmap.yml"
+        ssh_exec "rm -f /tmp/configmap.yml"
+
+        rm -f /tmp/configmap.yml
+
+        echo "✓ ConfigMap created/updated"
+
+    - name: Create/Update Secrets
+      if: inputs.secrets != '{}'
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NAMESPACE="${{ inputs.namespace }}"
+        APP_NAME="${{ inputs.app_name }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Creating Secret for sensitive data..."
+
+        # Parse secrets JSON and create secret data
+        cat > /tmp/parse_secret.py <<'PYTHON_SCRIPT'
+        import json
+        import sys
+        import yaml
+        import base64
+
+        secrets_json = sys.stdin.read().strip()
+        if secrets_json and secrets_json != '{}':
+            secrets_dict = json.loads(secrets_json)
+            # Base64 encode all values
+            data = {str(k): base64.b64encode(str(v).encode()).decode() for k, v in secrets_dict.items()}
+            print(yaml.dump({'data': data}, default_flow_style=False))
+        else:
+            print('data: {}')
+        PYTHON_SCRIPT
+
+        SECRET_DATA=$(echo '${{ inputs.secrets }}' | python3 /tmp/parse_secret.py)
+        rm -f /tmp/parse_secret.py
+
+        # Create Secret YAML
+        cat > /tmp/secret.yml <<EOF
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: ${APP_NAME}-secret
+          namespace: ${NAMESPACE}
+        type: Opaque
+        ${SECRET_DATA}
+        EOF
+
+        # Transfer and apply
+        scp -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no \
+            /tmp/secret.yml "$SSH_USER@$SSH_HOST:/tmp/secret.yml"
+
+        ssh_exec "kubectl apply -f /tmp/secret.yml"
+        ssh_exec "rm -f /tmp/secret.yml"
+
+        rm -f /tmp/secret.yml
+
+        echo "✓ Secret created/updated"
+
+    - name: Create/Update PersistentVolumeClaims
+      if: inputs.persistent_volumes != '[]'
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NAMESPACE="${{ inputs.namespace }}"
+        APP_NAME="${{ inputs.app_name }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Creating PersistentVolumeClaims..."
+
+        # Parse PVC JSON and create PVC manifests
+        cat > /tmp/parse_pvc.py <<'PYTHON_SCRIPT'
+        import json
+        import sys
+
+        pvcs_json = sys.stdin.read().strip()
+        if pvcs_json and pvcs_json != '[]':
+            pvcs_list = json.loads(pvcs_json)
+            for pvc in pvcs_list:
+                name = pvc.get('name', 'data')
+                size = pvc.get('size', '1Gi')
+                storage_class = pvc.get('storageClass', 'standard')
+
+                manifest = f"""---
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: {name}
+          namespace: $NAMESPACE
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: {storage_class}
+          resources:
+            requests:
+              storage: {size}
+        """
+                print(manifest)
+        PYTHON_SCRIPT
+
+        PVC_MANIFESTS=$(NAMESPACE="${NAMESPACE}" echo '${{ inputs.persistent_volumes }}' | python3 /tmp/parse_pvc.py)
+        rm -f /tmp/parse_pvc.py
+
+        if [ -n "$PVC_MANIFESTS" ]; then
+          echo "$PVC_MANIFESTS" > /tmp/pvcs.yml
+
+          # Transfer and apply
+          scp -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no \
+              /tmp/pvcs.yml "$SSH_USER@$SSH_HOST:/tmp/pvcs.yml"
+
+          ssh_exec "kubectl apply -f /tmp/pvcs.yml"
+          ssh_exec "rm -f /tmp/pvcs.yml"
+
+          rm -f /tmp/pvcs.yml
+
+          echo "✓ PersistentVolumeClaims created/updated"
+        fi
+
+    - name: Create/Update Deployment
+      id: deploy
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NAMESPACE="${{ inputs.namespace }}"
+        APP_NAME="${{ inputs.app_name }}"
+        DOCKER_IMAGE="${{ inputs.docker_image }}"
+        REPLICAS="${{ inputs.replicas }}"
+        CONTAINER_PORT="${{ inputs.container_port }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Creating Deployment manifest..."
+
+        # Parse labels and annotations
+        LABELS_JSON='${{ inputs.labels }}'
+        ANNOTATIONS_JSON='${{ inputs.annotations }}'
+
+        # Create deployment YAML
+        cat > /tmp/deployment.yml <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${APP_NAME}
+          namespace: ${NAMESPACE}
+          labels:
+            app: ${APP_NAME}
+            version: v1
+        spec:
+          replicas: ${REPLICAS}
+          selector:
+            matchLabels:
+              app: ${APP_NAME}
+          template:
+            metadata:
+              labels:
+                app: ${APP_NAME}
+                version: v1
+            spec:
+              containers:
+              - name: ${APP_NAME}
+                image: ${DOCKER_IMAGE}
+                ports:
+                - containerPort: ${CONTAINER_PORT}
+                  name: http
+                  protocol: TCP
+                resources:
+                  requests:
+                    cpu: ${{ inputs.cpu_request }}
+                    memory: ${{ inputs.memory_request }}
+                  limits:
+                    cpu: ${{ inputs.cpu_limit }}
+                    memory: ${{ inputs.memory_limit }}
+                envFrom:
+                - configMapRef:
+                    name: ${APP_NAME}-config
+        EOF
+
+        # Add secret ref if secrets exist
+        if [ '${{ inputs.secrets }}' != '{}' ]; then
+          cat >> /tmp/deployment.yml <<'EOF'
+                - secretRef:
+                    name: ${APP_NAME}-secret
+        EOF
+        fi
+
+        # Add liveness probe if enabled
+        if [ '${{ inputs.liveness_probe_enabled }}' = 'true' ]; then
+          cat >> /tmp/deployment.yml <<'EOF'
+                livenessProbe:
+                  httpGet:
+                    path: ${{ inputs.health_check_path }}
+                    port: http
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+        EOF
+        fi
+
+        # Add readiness probe if enabled
+        if [ '${{ inputs.readiness_probe_enabled }}' = 'true' ]; then
+          cat >> /tmp/deployment.yml <<'EOF'
+                readinessProbe:
+                  httpGet:
+                    path: ${{ inputs.health_check_path }}
+                    port: http
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+                  timeoutSeconds: 3
+                  failureThreshold: 3
+        EOF
+        fi
+
+        # Add volume mounts if specified
+        if [ '${{ inputs.volume_mounts }}' != '[]' ]; then
+          cat > /tmp/parse_volumes.py <<'PYTHON_SCRIPT'
+        import json
+        import sys
+
+        volumes_json = sys.stdin.read().strip()
+        if volumes_json and volumes_json != '[]':
+            volumes_list = json.loads(volumes_json)
+            print('                volumeMounts:')
+            for vol in volumes_list:
+                name = vol.get('name')
+                mount_path = vol.get('mountPath')
+                sub_path = vol.get('subPath', '')
+                print(f'                - name: {name}')
+                print(f'                  mountPath: {mount_path}')
+                if sub_path:
+                    print(f'                  subPath: {sub_path}')
+        PYTHON_SCRIPT
+
+          VOLUME_MOUNTS=$(echo '${{ inputs.volume_mounts }}' | python3 /tmp/parse_volumes.py)
+          echo "$VOLUME_MOUNTS" >> /tmp/deployment.yml
+          rm -f /tmp/parse_volumes.py
+
+          # Add volumes section
+          cat > /tmp/parse_pvc_volumes.py <<'PYTHON_SCRIPT'
+        import json
+        import sys
+
+        pvcs_json = sys.stdin.read().strip()
+        if pvcs_json and pvcs_json != '[]':
+            pvcs_list = json.loads(pvcs_json)
+            print('              volumes:')
+            for pvc in pvcs_list:
+                name = pvc.get('name')
+                print(f'              - name: {name}')
+                print(f'                persistentVolumeClaim:')
+                print(f'                  claimName: {name}')
+        PYTHON_SCRIPT
+
+          if [ '${{ inputs.persistent_volumes }}' != '[]' ]; then
+            VOLUMES=$(echo '${{ inputs.persistent_volumes }}' | python3 /tmp/parse_pvc_volumes.py)
+            echo "$VOLUMES" >> /tmp/deployment.yml
+            rm -f /tmp/parse_pvc_volumes.py
+          fi
+        fi
+
+        # Add imagePullSecrets if specified
+        if [ -n "${{ inputs.image_pull_secret }}" ]; then
+          cat >> /tmp/deployment.yml <<EOF
+              imagePullSecrets:
+              - name: ${{ inputs.image_pull_secret }}
+        EOF
+        elif [ -n "${{ inputs.registry_url }}" ]; then
+          cat >> /tmp/deployment.yml <<EOF
+              imagePullSecrets:
+              - name: ${APP_NAME}-registry-secret
+        EOF
+        fi
+
+        # Substitute variables
+        envsubst < /tmp/deployment.yml > /tmp/deployment_final.yml
+        mv /tmp/deployment_final.yml /tmp/deployment.yml
+
+        # Show deployment config (sanitized)
+        echo "Deployment configuration:"
+        cat /tmp/deployment.yml | head -50
+
+        # Transfer and apply
+        scp -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no \
+            /tmp/deployment.yml "$SSH_USER@$SSH_HOST:/tmp/deployment.yml"
+
+        # Get current revision for potential rollback
+        CURRENT_REVISION=$(ssh_exec "kubectl rollout history deployment/${APP_NAME} -n ${NAMESPACE} 2>/dev/null | tail -2 | head -1 | awk '{print \$1}'" || echo "")
+        echo "Current revision: ${CURRENT_REVISION:-none}"
+
+        # Apply deployment
+        if ssh_exec "kubectl apply -f /tmp/deployment.yml"; then
+          echo "✓ Deployment manifest applied"
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "previous_revision=$CURRENT_REVISION" >> $GITHUB_OUTPUT
+        else
+          echo "❌ Failed to apply deployment"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          ssh_exec "rm -f /tmp/deployment.yml"
+          rm -f /tmp/deployment.yml
+          exit 1
+        fi
+
+        ssh_exec "rm -f /tmp/deployment.yml"
+        rm -f /tmp/deployment.yml
+
+    - name: Wait for rollout
+      id: rollout
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NAMESPACE="${{ inputs.namespace }}"
+        APP_NAME="${{ inputs.app_name }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Waiting for rollout to complete..."
+
+        # Wait for rollout with timeout (5 minutes)
+        if ssh_exec "kubectl rollout status deployment/${APP_NAME} -n ${NAMESPACE} --timeout=5m"; then
+          echo "✓ Rollout completed successfully"
+          echo "status=success" >> $GITHUB_OUTPUT
+
+          # Show pod status
+          echo "Pod status:"
+          ssh_exec "kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME}"
+        else
+          echo "❌ Rollout failed or timed out"
+          echo "status=failed" >> $GITHUB_OUTPUT
+
+          # Show pod status for debugging
+          echo "Pod status:"
+          ssh_exec "kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME}"
+
+          echo "Pod events:"
+          ssh_exec "kubectl get events -n ${NAMESPACE} --sort-by='.lastTimestamp' | grep ${APP_NAME} | tail -20"
+
+          if [ '${{ inputs.rollback_on_failure }}' = 'true' ] && [ -n "${{ steps.deploy.outputs.previous_revision }}" ]; then
+            echo "Initiating rollback to revision ${{ steps.deploy.outputs.previous_revision }}..."
+            ssh_exec "kubectl rollout undo deployment/${APP_NAME} -n ${NAMESPACE}"
+            echo "status=rolled_back" >> $GITHUB_OUTPUT
+          fi
+
+          exit 1
+        fi
+
+    - name: Create/Update Service
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NAMESPACE="${{ inputs.namespace }}"
+        APP_NAME="${{ inputs.app_name }}"
+        SERVICE_PORT="${{ inputs.service_port }}"
+        CONTAINER_PORT="${{ inputs.container_port }}"
+        SERVICE_TYPE="${{ inputs.service_type }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Creating Service manifest..."
+
+        cat > /tmp/service.yml <<EOF
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${APP_NAME}
+          namespace: ${NAMESPACE}
+          labels:
+            app: ${APP_NAME}
+        spec:
+          type: ${SERVICE_TYPE}
+          selector:
+            app: ${APP_NAME}
+          ports:
+          - port: ${SERVICE_PORT}
+            targetPort: ${CONTAINER_PORT}
+            protocol: TCP
+            name: http
+        EOF
+
+        # Transfer and apply
+        scp -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no \
+            /tmp/service.yml "$SSH_USER@$SSH_HOST:/tmp/service.yml"
+
+        ssh_exec "kubectl apply -f /tmp/service.yml"
+        ssh_exec "rm -f /tmp/service.yml"
+
+        rm -f /tmp/service.yml
+
+        echo "✓ Service created/updated"
+
+    - name: Get Service endpoint info
+      id: service_info
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NAMESPACE="${{ inputs.namespace }}"
+        APP_NAME="${{ inputs.app_name }}"
+        SERVICE_TYPE="${{ inputs.service_type }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Getting service endpoint information..."
+
+        if [ "$SERVICE_TYPE" = "LoadBalancer" ]; then
+          # Wait for external IP
+          echo "Waiting for LoadBalancer external IP..."
+          EXTERNAL_IP=""
+          for i in {1..30}; do
+            EXTERNAL_IP=$(ssh_exec "kubectl get svc ${APP_NAME} -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].ip}'" || echo "")
+            if [ -n "$EXTERNAL_IP" ] && [ "$EXTERNAL_IP" != "<pending>" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -n "$EXTERNAL_IP" ] && [ "$EXTERNAL_IP" != "<pending>" ]; then
+            ENDPOINT="http://${EXTERNAL_IP}:${{ inputs.service_port }}"
+            echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+            echo "✓ LoadBalancer endpoint: $ENDPOINT"
+          else
+            echo "⚠️  LoadBalancer external IP still pending"
+            echo "endpoint=pending" >> $GITHUB_OUTPUT
+          fi
+
+        elif [ "$SERVICE_TYPE" = "NodePort" ]; then
+          NODE_PORT=$(ssh_exec "kubectl get svc ${APP_NAME} -n ${NAMESPACE} -o jsonpath='{.spec.ports[0].nodePort}'" || echo "")
+          if [ -n "$NODE_PORT" ]; then
+            ENDPOINT="http://<node-ip>:${NODE_PORT}"
+            echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+            echo "✓ NodePort endpoint: $ENDPOINT"
+          fi
+
+        else
+          CLUSTER_IP=$(ssh_exec "kubectl get svc ${APP_NAME} -n ${NAMESPACE} -o jsonpath='{.spec.clusterIP}'" || echo "")
+          ENDPOINT="http://${CLUSTER_IP}:${{ inputs.service_port }}"
+          echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+          echo "✓ ClusterIP endpoint: $ENDPOINT (internal only)"
+        fi
+
+    - name: Create/Update Ingress
+      if: inputs.ingress_enabled == 'true'
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NAMESPACE="${{ inputs.namespace }}"
+        APP_NAME="${{ inputs.app_name }}"
+        INGRESS_HOST="${{ inputs.ingress_host }}"
+        INGRESS_CLASS="${{ inputs.ingress_class }}"
+        SERVICE_PORT="${{ inputs.service_port }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Creating Ingress manifest..."
+
+        cat > /tmp/ingress.yml <<EOF
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: ${APP_NAME}
+          namespace: ${NAMESPACE}
+          annotations:
+            kubernetes.io/ingress.class: ${INGRESS_CLASS}
+        spec:
+          rules:
+          - host: ${INGRESS_HOST}
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: ${APP_NAME}
+                    port:
+                      number: ${SERVICE_PORT}
+        EOF
+
+        # Add TLS if enabled
+        if [ '${{ inputs.ingress_tls_enabled }}' = 'true' ] && [ -n '${{ inputs.ingress_tls_secret }}' ]; then
+          cat >> /tmp/ingress.yml <<EOF
+          tls:
+          - hosts:
+            - ${INGRESS_HOST}
+            secretName: ${{ inputs.ingress_tls_secret }}
+        EOF
+        fi
+
+        # Transfer and apply
+        scp -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no \
+            /tmp/ingress.yml "$SSH_USER@$SSH_HOST:/tmp/ingress.yml"
+
+        ssh_exec "kubectl apply -f /tmp/ingress.yml"
+        ssh_exec "rm -f /tmp/ingress.yml"
+
+        rm -f /tmp/ingress.yml
+
+        echo "✓ Ingress created/updated"
+        echo "Ingress URL: https://${INGRESS_HOST}"
+
+    - name: Health check
+      id: health
+      if: inputs.skip_health_check != 'true'
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        NAMESPACE="${{ inputs.namespace }}"
+        APP_NAME="${{ inputs.app_name }}"
+        HEALTH_PATH="${{ inputs.health_check_path }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_k8s -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Performing health check..."
+
+        # Wait for pods to be ready
+        sleep 10
+
+        # Get a pod name
+        POD_NAME=$(ssh_exec "kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o jsonpath='{.items[0].metadata.name}'" || echo "")
+
+        if [ -z "$POD_NAME" ]; then
+          echo "❌ No pods found"
+          echo "passed=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+        echo "Testing pod: $POD_NAME"
+
+        # Retry logic for health check
+        MAX_RETRIES=6
+        RETRY_DELAY=5
+        RETRY_COUNT=0
+
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+          echo "Health check attempt $((RETRY_COUNT + 1))/$MAX_RETRIES..."
+
+          # Execute curl inside the pod
+          HTTP_CODE=$(ssh_exec "kubectl exec -n ${NAMESPACE} ${POD_NAME} -- curl -s -o /dev/null -w '%{http_code}' http://localhost:${{ inputs.container_port }}${HEALTH_PATH}" 2>/dev/null || echo "000")
+
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "301" ] || [ "$HTTP_CODE" = "302" ]; then
+            echo "✓ Health check passed (HTTP $HTTP_CODE)"
+            echo "passed=true" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "Health check returned HTTP $HTTP_CODE"
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "Waiting $RETRY_DELAY seconds before retry..."
+              sleep $RETRY_DELAY
+            fi
+          fi
+        done
+
+        echo "❌ Health check failed after $MAX_RETRIES attempts"
+        echo "passed=false" >> $GITHUB_OUTPUT
+
+        # Show pod logs for debugging
+        echo "Recent pod logs:"
+        ssh_exec "kubectl logs ${POD_NAME} -n ${NAMESPACE} --tail=100" || true
+
+        exit 1
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        rm -f ~/.ssh/deploy_key_k8s
+        echo "✓ Cleaned up SSH keys"

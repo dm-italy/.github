@@ -1,0 +1,7 @@
+{
+  "name": "Deploy .NET Service to systemd",
+  "description": "Build and deploy a .NET service with systemd management and Nginx reverse proxy",
+  "iconName": "dotnet",
+  "categories": ["Deployment", ".NET", "Systemd"],
+  "filePatterns": ["**/*.csproj", "**/*.sln"]
+}

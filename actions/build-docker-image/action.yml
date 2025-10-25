@@ -1,0 +1,337 @@
+name: 'Build Docker Image'
+description: 'Build and push Docker images with multi-platform support and GitHub Container Registry integration'
+author: 'DiemmeGroup DevOps'
+
+inputs:
+  context_path:
+    description: 'Docker build context path'
+    required: false
+    default: '.'
+  dockerfile_path:
+    description: 'Path to Dockerfile'
+    required: false
+    default: './Dockerfile'
+  image_name:
+    description: 'Docker image name (without registry and owner, e.g., microservices/identity)'
+    required: true
+  image_tags:
+    description: 'Comma-separated list of image tags (e.g., latest,v1.0.0,sha-abc123)'
+    required: true
+  registry_url:
+    description: 'Docker registry URL'
+    required: false
+    default: 'ghcr.io'
+  repository_owner:
+    description: 'Repository owner (for ghcr.io path, e.g., dm-italy). If not specified, image_name must include the full path.'
+    required: false
+    default: ''
+  registry_username:
+    description: 'Docker registry username'
+    required: true
+  registry_password:
+    description: 'Docker registry password/token'
+    required: true
+  platforms:
+    description: 'Target platforms for multi-platform build (e.g., linux/amd64,linux/arm64)'
+    required: false
+    default: 'linux/amd64'
+  build_args:
+    description: 'Build arguments as JSON object (e.g., {"ARG1":"value1","ARG2":"value2"})'
+    required: false
+    default: '{}'
+  secrets:
+    description: 'Build secrets as JSON object (e.g., {"SECRET1":"value1","SECRET2":"value2"}) - for --mount=type=secret'
+    required: false
+    default: '{}'
+  labels:
+    description: 'Image labels as JSON object'
+    required: false
+    default: '{}'
+  push:
+    description: 'Push image to registry'
+    required: false
+    default: 'true'
+  cache_from:
+    description: 'Cache source (e.g., type=registry,ref=ghcr.io/org/image:buildcache)'
+    required: false
+    default: ''
+  cache_to:
+    description: 'Cache destination (e.g., type=registry,ref=ghcr.io/org/image:buildcache,mode=max)'
+    required: false
+    default: ''
+  load:
+    description: 'Load image to docker (cannot be used with multi-platform builds)'
+    required: false
+    default: 'false'
+
+outputs:
+  image_digest:
+    description: 'Image digest (sha256:...)'
+    value: ${{ steps.build.outputs.digest }}
+  image_tags:
+    description: 'Full image references with tags'
+    value: ${{ steps.prepare.outputs.full_tags }}
+  image_metadata:
+    description: 'Build metadata JSON'
+    value: ${{ steps.build.outputs.metadata }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Docker Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry_url }}
+        username: ${{ inputs.registry_username }}
+        password: ${{ inputs.registry_password }}
+
+    - name: Prepare image metadata
+      id: prepare
+      shell: bash
+      run: |
+        REGISTRY="${{ inputs.registry_url }}"
+        IMAGE_NAME="${{ inputs.image_name }}"
+        REPOSITORY_OWNER="${{ inputs.repository_owner }}"
+        TAGS="${{ inputs.image_tags }}"
+
+        echo "Preparing Docker image metadata..."
+        echo "Registry: $REGISTRY"
+        echo "Repository Owner: $REPOSITORY_OWNER"
+        echo "Image: $IMAGE_NAME"
+        echo "Tags: $TAGS"
+
+        # Function to normalize Docker image path (remove consecutive duplicate segments)
+        normalize_docker_path() {
+          local input_path="$1"
+
+          # Split path by '/' and remove consecutive duplicates
+          IFS='/' read -ra PARTS <<< "$input_path"
+          local NORMALIZED_PARTS=()
+          local PREV_PART=""
+
+          for part in "${PARTS[@]}"; do
+            # Skip if this part is the same as the previous one (duplicate segment)
+            if [ "$part" != "$PREV_PART" ] || [ -z "$PREV_PART" ]; then
+              NORMALIZED_PARTS+=("$part")
+            fi
+            PREV_PART="$part"
+          done
+
+          # Rebuild the normalized path
+          local normalized=$(IFS='/'; echo "${NORMALIZED_PARTS[*]}")
+          echo "$normalized"
+        }
+
+        # Build full image path with owner if provided
+        if [ -n "$REPOSITORY_OWNER" ]; then
+          FULL_IMAGE_PATH_RAW="$REGISTRY/$REPOSITORY_OWNER/$IMAGE_NAME"
+          FULL_IMAGE_PATH=$(normalize_docker_path "$FULL_IMAGE_PATH_RAW")
+
+          if [ "$FULL_IMAGE_PATH" != "$FULL_IMAGE_PATH_RAW" ]; then
+            echo "⚠️  Docker image path normalized:"
+            echo "   Original:    $FULL_IMAGE_PATH_RAW"
+            echo "   Normalized:  $FULL_IMAGE_PATH"
+          else
+            echo "Full image path (with owner): $FULL_IMAGE_PATH"
+          fi
+        else
+          FULL_IMAGE_PATH_RAW="$REGISTRY/$IMAGE_NAME"
+          FULL_IMAGE_PATH=$(normalize_docker_path "$FULL_IMAGE_PATH_RAW")
+
+          if [ "$FULL_IMAGE_PATH" != "$FULL_IMAGE_PATH_RAW" ]; then
+            echo "⚠️  Docker image path normalized:"
+            echo "   Original:    $FULL_IMAGE_PATH_RAW"
+            echo "   Normalized:  $FULL_IMAGE_PATH"
+          else
+            echo "Full image path (owner included in image_name): $FULL_IMAGE_PATH"
+          fi
+        fi
+
+        # Build full image references with all tags
+        FULL_TAGS=""
+        IFS=',' read -ra TAG_ARRAY <<< "$TAGS"
+        for tag in "${TAG_ARRAY[@]}"; do
+          tag=$(echo "$tag" | xargs)  # Trim whitespace
+          if [ -n "$FULL_TAGS" ]; then
+            FULL_TAGS="$FULL_TAGS,"
+          fi
+          FULL_TAGS="$FULL_TAGS$FULL_IMAGE_PATH:$tag"
+        done
+
+        echo "full_tags=$FULL_TAGS" >> $GITHUB_OUTPUT
+        echo ""
+        echo "Full image tags:"
+        echo "$FULL_TAGS" | tr ',' '\n'
+
+    - name: Prepare build arguments
+      id: build-args
+      shell: bash
+      run: |
+        BUILD_ARGS='${{ inputs.build_args }}'
+
+        echo "Preparing build arguments..."
+
+        if [ "$BUILD_ARGS" != "{}" ]; then
+          # Convert JSON to --build-arg format using Python
+          cat > /tmp/parse_build_args.py <<'PYTHON_SCRIPT'
+        import json
+        import sys
+
+        build_args_json = sys.stdin.read().strip()
+        if build_args_json and build_args_json != '{}':
+            build_args_dict = json.loads(build_args_json)
+            args = []
+            for key, value in build_args_dict.items():
+                # Escape delle quote nel valore
+                escaped_value = str(value).replace('"', '\\"')
+                args.append(f'--build-arg {key}="{escaped_value}"')
+            print(' '.join(args))
+        PYTHON_SCRIPT
+
+          BUILD_ARGS_STRING=$(echo "$BUILD_ARGS" | python3 /tmp/parse_build_args.py)
+          rm -f /tmp/parse_build_args.py
+
+          echo "build_args_string=$BUILD_ARGS_STRING" >> $GITHUB_OUTPUT
+          echo "✓ Build arguments prepared"
+          echo "Arguments: $BUILD_ARGS_STRING"
+        else
+          echo "build_args_string=" >> $GITHUB_OUTPUT
+          echo "No build arguments specified"
+        fi
+
+    - name: Prepare labels
+      id: labels
+      shell: bash
+      run: |
+        LABELS='${{ inputs.labels }}'
+
+        echo "Preparing image labels..."
+
+        # Convert labels to --label format using Python
+        cat > /tmp/parse_labels.py <<'PYTHON_SCRIPT'
+        import json
+        import sys
+        from datetime import datetime
+
+        # Default labels
+        default_labels = {
+            "org.opencontainers.image.created": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "org.opencontainers.image.source": "${{ github.server_url }}/${{ github.repository }}",
+            "org.opencontainers.image.revision": "${{ github.sha }}"
+        }
+
+        # Parse user labels
+        user_labels_json = sys.stdin.read().strip()
+        if user_labels_json and user_labels_json != '{}':
+            user_labels = json.loads(user_labels_json)
+            default_labels.update(user_labels)
+
+        # Convert to --label format
+        labels = []
+        for key, value in default_labels.items():
+            # Escape delle quote nel valore
+            escaped_value = str(value).replace('"', '\\"')
+            labels.append(f'--label {key}="{escaped_value}"')
+
+        print(' '.join(labels))
+        PYTHON_SCRIPT
+
+        LABELS_STRING=$(echo "$LABELS" | python3 /tmp/parse_labels.py)
+        rm -f /tmp/parse_labels.py
+
+        echo "labels_string=$LABELS_STRING" >> $GITHUB_OUTPUT
+        echo "✓ Labels prepared"
+
+    - name: Prepare secrets
+      id: secrets
+      shell: bash
+      run: |
+        SECRETS='${{ inputs.secrets }}'
+
+        echo "Preparing build secrets..."
+
+        if [ "$SECRETS" != "{}" ]; then
+          # Convert JSON to key=value format for docker/build-push-action secrets
+          cat > /tmp/parse_secrets.py <<'PYTHON_SCRIPT'
+        import json
+        import sys
+
+        secrets_json = sys.stdin.read().strip()
+        if secrets_json and secrets_json != '{}':
+            secrets_dict = json.loads(secrets_json)
+            secrets = []
+            for key, value in secrets_dict.items():
+                # Format: id=SECRET_NAME,src=/path or just SECRET_NAME=value
+                secrets.append(f'{key}={value}')
+            print('\n'.join(secrets))
+        PYTHON_SCRIPT
+
+          SECRETS_STRING=$(echo "$SECRETS" | python3 /tmp/parse_secrets.py)
+          rm -f /tmp/parse_secrets.py
+
+          echo "secrets_string<<EOF" >> $GITHUB_OUTPUT
+          echo "$SECRETS_STRING" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "✓ Build secrets prepared"
+        else
+          echo "secrets_string=" >> $GITHUB_OUTPUT
+          echo "No build secrets specified"
+        fi
+
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ inputs.context_path }}
+        file: ${{ inputs.dockerfile_path }}
+        platforms: ${{ inputs.platforms }}
+        push: ${{ inputs.push }}
+        load: ${{ inputs.load }}
+        tags: ${{ steps.prepare.outputs.full_tags }}
+        build-args: ${{ steps.build-args.outputs.build_args_string }}
+        labels: ${{ steps.labels.outputs.labels_string }}
+        secrets: ${{ steps.secrets.outputs.secrets_string }}
+        cache-from: ${{ inputs.cache_from }}
+        cache-to: ${{ inputs.cache_to }}
+
+    - name: Display build summary
+      shell: bash
+      run: |
+        echo ""
+        echo "## 🐳 Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Registry:** ${{ inputs.registry_url }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Image:** ${{ inputs.image_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Platforms:** ${{ inputs.platforms }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        echo "### Image Tags" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "${{ steps.prepare.outputs.full_tags }}" | tr ',' '\n' | while read tag; do
+          echo "- \`$tag\`" >> $GITHUB_STEP_SUMMARY
+        done
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.push }}" = "true" ]; then
+          echo "✓ **Status:** Image pushed to registry" >> $GITHUB_STEP_SUMMARY
+          echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "ℹ️ **Status:** Image built (not pushed)" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Pull Command:**" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        FIRST_TAG=$(echo "${{ steps.prepare.outputs.full_tags }}" | cut -d',' -f1)
+        echo "docker pull $FIRST_TAG" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        echo "✓ Docker build completed"

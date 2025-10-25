@@ -1,0 +1,68 @@
+name: Deploy .NET Service to systemd
+
+on:
+  push:
+    branches: [update]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .NET Project
+        uses: dm-italy/.github/actions/build-dotnet@main
+        with:
+          dotnet_version: '8.0.x'
+          project_path: '.'  # ⬅️ Customize: path to your project
+          csproj_pattern: '**/*.HttpApi.Host.csproj'  # ⬅️ Customize: your .csproj pattern
+          build_configuration: 'Release'
+          version: '1.0.0'  # ⬅️ Customize: or use version-management action
+          artifact_name: 'my-service-build'  # ⬅️ Customize: your artifact name
+          skip_tests: 'true'
+          nuget_feed_username: ${{ github.actor }}
+          nuget_feed_password: ${{ secrets.GITHUB_TOKEN }}
+          abp_nuget_api_key: ${{ secrets.ABP_NUGET_API_KEY }}
+          devexpress_nuget_key: ${{ secrets.DEVEXPRESS_NUGET_KEY }}
+          telerik_username: ${{ secrets.TELERIK_USERNAME }}
+          telerik_password: ${{ secrets.TELERIK_PASSWORD }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to systemd
+        uses: dm-italy/.github/actions/deploy-systemd@main
+        with:
+          ssh_key: ${{ secrets.SSH_KEY }}
+          ssh_host: ${{ secrets.SSH_HOST }}
+          ssh_user: ${{ secrets.SSH_USER }}
+          service_name: 'my-service'  # ⬅️ Customize: your service name
+          deploy_path: '/opt/services/my-service'  # ⬅️ Customize: deployment path
+          artifact_name: 'my-service-build'  # ⬅️ Match artifact name from build
+          appsettings_json: |
+            {
+              "ConnectionStrings": {
+                "Default": "${{ secrets.DB_CONNECTION_STRING }}"
+              },
+              "App": {
+                "SelfUrl": "https://api.example.com"
+              }
+            }
+          service_port: 8080  # ⬅️ Customize: your service port
+          dotnet_version: '8.0'
+          environment_name: 'Production'
+
+      - name: Configure Nginx with SSL
+        uses: dm-italy/.github/actions/deploy-nginx@main
+        with:
+          ssh_key: ${{ secrets.SSH_KEY }}
+          ssh_host: ${{ secrets.SSH_HOST }}
+          ssh_user: ${{ secrets.SSH_USER }}
+          service_name: 'my-service'  # ⬅️ Match service name
+          backend_host: 'localhost'
+          backend_port: 8080  # ⬅️ Match service port
+          domain: 'api.example.com'  # ⬅️ Customize: your domain
+          ssl_mode: 'auto'  # auto (Let's Encrypt), self-signed, disable
+          force_ssl: 'true'

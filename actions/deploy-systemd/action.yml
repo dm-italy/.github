@@ -1,0 +1,321 @@
+name: 'Deploy .NET Systemd Service'
+description: 'Deploy .NET application as systemd service on Linux server'
+author: 'DiemmeGroup DevOps'
+
+inputs:
+  ssh_key:
+    description: 'SSH private key for authentication'
+    required: true
+  ssh_host:
+    description: 'Target deployment host'
+    required: true
+  ssh_user:
+    description: 'SSH username for deployment'
+    required: true
+  service_name:
+    description: 'Systemd service name (e.g., factory-gateway)'
+    required: true
+  deploy_path:
+    description: 'Deployment directory path (e.g., /opt/factory-gateway)'
+    required: true
+  artifact_name:
+    description: 'Build artifact name to download from artifacts'
+    required: true
+  appsettings_json:
+    description: 'appsettings.json content as JSON string'
+    required: true
+  service_port:
+    description: 'Application listening port (for health checks)'
+    required: true
+  dotnet_version:
+    description: '.NET runtime version'
+    required: false
+    default: '7.0'
+  environment_name:
+    description: 'ASPNETCORE_ENVIRONMENT value'
+    required: false
+    default: 'Production'
+  skip_health_check:
+    description: 'Skip post-deployment health check'
+    required: false
+    default: 'false'
+  health_endpoint:
+    description: 'Health check endpoint path'
+    required: false
+    default: '/health'
+  backup_previous:
+    description: 'Backup previous deployment'
+    required: false
+    default: 'true'
+
+outputs:
+  deployment_status:
+    description: 'Deployment status: success, failed'
+    value: ${{ steps.deploy.outputs.status }}
+  service_url:
+    description: 'Service local URL'
+    value: ${{ steps.deploy.outputs.url }}
+  health_check_passed:
+    description: 'Health check result'
+    value: ${{ steps.health.outputs.passed }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure SSH key
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ inputs.ssh_key }}" > ~/.ssh/deploy_key_systemd
+        chmod 600 ~/.ssh/deploy_key_systemd
+        ssh-keyscan -H "${{ inputs.ssh_host }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+    - name: Verify prerequisites
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        DOTNET_VERSION="${{ inputs.dotnet_version }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_systemd -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Verifying .NET runtime..."
+        if ! ssh_exec "dotnet --list-runtimes | grep -q 'Microsoft.AspNetCore.App $DOTNET_VERSION'"; then
+          echo "❌ .NET $DOTNET_VERSION runtime not installed"
+          echo "Please install with: wget https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh && sudo bash dotnet-install.sh --runtime aspnetcore --version $DOTNET_VERSION"
+          exit 1
+        fi
+
+        echo "✓ .NET $DOTNET_VERSION runtime installed"
+
+        echo "Verifying systemd..."
+        if ! ssh_exec "command -v systemctl &> /dev/null"; then
+          echo "❌ systemd not available"
+          exit 1
+        fi
+
+        echo "✓ systemd available"
+
+    - name: Download build artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: ./deploy-package
+
+    - name: Display artifact contents
+      shell: bash
+      run: |
+        echo "Artifact contents:"
+        ls -lah ./deploy-package/
+        echo ""
+        echo "Looking for .dll files:"
+        find ./deploy-package -name "*.dll" -type f
+
+    - name: Deploy to server
+      id: deploy
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        SERVICE_NAME="${{ inputs.service_name }}"
+        DEPLOY_PATH="${{ inputs.deploy_path }}"
+        BACKUP="${{ inputs.backup_previous }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_systemd -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Preparing deployment directory..."
+
+        # Create deployment directory structure
+        ssh_exec "sudo mkdir -p $DEPLOY_PATH"
+        ssh_exec "sudo chown -R $SSH_USER:$SSH_USER $DEPLOY_PATH"
+
+        # Stop service if running
+        echo "Stopping service if running..."
+        if ssh_exec "systemctl is-active --quiet $SERVICE_NAME 2>/dev/null"; then
+          ssh_exec "sudo systemctl stop $SERVICE_NAME"
+          echo "✓ Service stopped"
+        else
+          echo "Service not running"
+        fi
+
+        # Backup current deployment
+        if [ "$BACKUP" = "true" ]; then
+          if ssh_exec "[ -d $DEPLOY_PATH/app ]"; then
+            BACKUP_DIR="$DEPLOY_PATH/app.backup.$(date +%Y%m%d_%H%M%S)"
+            echo "Creating backup: $BACKUP_DIR"
+            ssh_exec "sudo mv $DEPLOY_PATH/app $BACKUP_DIR"
+            echo "✓ Backup created"
+
+            # Cleanup old backups (keep last 3)
+            ssh_exec "ls -dt $DEPLOY_PATH/app.backup.* 2>/dev/null | tail -n +4 | xargs -r sudo rm -rf" || true
+          fi
+        else
+          ssh_exec "sudo rm -rf $DEPLOY_PATH/app" || true
+        fi
+
+        # Create app directory
+        ssh_exec "mkdir -p $DEPLOY_PATH/app"
+
+        # Transfer application files
+        echo "Transferring application files..."
+        tar -czf /tmp/deploy_package.tar.gz -C ./deploy-package .
+        scp -i ~/.ssh/deploy_key_systemd -o StrictHostKeyChecking=no /tmp/deploy_package.tar.gz $SSH_USER@$SSH_HOST:/tmp/
+        ssh_exec "tar -xzf /tmp/deploy_package.tar.gz -C $DEPLOY_PATH/app/"
+        ssh_exec "rm -f /tmp/deploy_package.tar.gz"
+        rm -f /tmp/deploy_package.tar.gz
+
+        echo "✓ Application files transferred"
+
+        # Write appsettings.json
+        echo "Writing appsettings.json..."
+        echo '${{ inputs.appsettings_json }}' | ssh_exec "tee $DEPLOY_PATH/app/appsettings.json > /dev/null"
+        echo "✓ appsettings.json written"
+
+        # Find main .dll file
+        MAIN_DLL=$(ssh_exec "find $DEPLOY_PATH/app -maxdepth 1 -name '*.HttpApi.Host.dll' -o -name '$SERVICE_NAME.dll' | head -1")
+
+        if [ -z "$MAIN_DLL" ]; then
+          echo "❌ Could not find main .dll file"
+          echo "Available .dll files:"
+          ssh_exec "find $DEPLOY_PATH/app -name '*.dll'"
+          exit 1
+        fi
+
+        echo "Main DLL: $MAIN_DLL"
+
+        # Create systemd unit file
+        echo "Creating systemd unit file..."
+
+        cat > /tmp/systemd_unit.service <<EOF
+        [Unit]
+        Description=$SERVICE_NAME - DiemmeGroup Microservice
+        After=network.target
+
+        [Service]
+        Type=notify
+        WorkingDirectory=$DEPLOY_PATH/app
+        ExecStart=/usr/bin/dotnet $MAIN_DLL
+        Restart=always
+        RestartSec=10
+        KillSignal=SIGINT
+        SyslogIdentifier=$SERVICE_NAME
+        User=$SSH_USER
+        Environment=ASPNETCORE_ENVIRONMENT=${{ inputs.environment_name }}
+        Environment=DOTNET_PRINT_TELEMETRY_MESSAGE=false
+        Environment=DOTNET_SKIP_FIRST_TIME_EXPERIENCE=true
+
+        # Security settings
+        NoNewPrivileges=true
+        PrivateTmp=true
+
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+
+        cat /tmp/systemd_unit.service | ssh_exec "sudo tee /etc/systemd/system/$SERVICE_NAME.service > /dev/null"
+        rm -f /tmp/systemd_unit.service
+
+        echo "✓ Systemd unit file created"
+
+        # Reload systemd and start service
+        echo "Starting service..."
+        ssh_exec "sudo systemctl daemon-reload"
+        ssh_exec "sudo systemctl enable $SERVICE_NAME"
+        ssh_exec "sudo systemctl start $SERVICE_NAME"
+
+        # Wait for service startup
+        echo "Waiting for service to start..."
+        sleep 15
+
+        # Check service status
+        if ssh_exec "systemctl is-active --quiet $SERVICE_NAME"; then
+          echo "✓ Service started successfully"
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "url=http://localhost:${{ inputs.service_port }}" >> $GITHUB_OUTPUT
+
+          # Display service status
+          ssh_exec "sudo systemctl status $SERVICE_NAME --no-pager -l" || true
+        else
+          echo "❌ Service failed to start"
+          echo "status=failed" >> $GITHUB_OUTPUT
+
+          # Show logs for debugging
+          echo "Service logs:"
+          ssh_exec "sudo journalctl -u $SERVICE_NAME --no-pager -n 100" || true
+
+          exit 1
+        fi
+
+    - name: Health check
+      id: health
+      if: inputs.skip_health_check != 'true'
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        SERVICE_PORT="${{ inputs.service_port }}"
+        HEALTH_ENDPOINT="${{ inputs.health_endpoint }}"
+        SERVICE_NAME="${{ inputs.service_name }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_systemd -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Performing health check..."
+        echo "Endpoint: http://localhost:$SERVICE_PORT$HEALTH_ENDPOINT"
+
+        # Wait a bit more for the service to be fully ready
+        sleep 10
+
+        # Retry logic for health check
+        MAX_RETRIES=6
+        RETRY_DELAY=5
+        RETRY_COUNT=0
+
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+          echo "Health check attempt $((RETRY_COUNT + 1))/$MAX_RETRIES..."
+
+          HTTP_CODE=$(ssh_exec "curl -s -o /dev/null -w '%{http_code}' http://localhost:$SERVICE_PORT$HEALTH_ENDPOINT" || echo "000")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✓ Health check passed (HTTP $HTTP_CODE)"
+            echo "passed=true" >> $GITHUB_OUTPUT
+
+            # Get health check response
+            HEALTH_RESPONSE=$(ssh_exec "curl -s http://localhost:$SERVICE_PORT$HEALTH_ENDPOINT" || echo "")
+            if [ -n "$HEALTH_RESPONSE" ]; then
+              echo "Health response: $HEALTH_RESPONSE"
+            fi
+
+            exit 0
+          else
+            echo "Health check returned HTTP $HTTP_CODE"
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "Waiting $RETRY_DELAY seconds before retry..."
+              sleep $RETRY_DELAY
+            fi
+          fi
+        done
+
+        echo "❌ Health check failed after $MAX_RETRIES attempts"
+        echo "passed=false" >> $GITHUB_OUTPUT
+
+        # Show recent logs for debugging
+        echo "Recent service logs:"
+        ssh_exec "sudo journalctl -u $SERVICE_NAME --no-pager -n 50" || true
+
+        exit 1
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        rm -f ~/.ssh/deploy_key_systemd
+        rm -rf ./deploy-package
+        echo "✓ Cleaned up temporary files"

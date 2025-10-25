@@ -1,0 +1,550 @@
+name: 'Configure Nginx Reverse Proxy'
+description: 'Configure Nginx reverse proxy with SSL/TLS support (Let''s Encrypt or self-signed)'
+author: 'DiemmeGroup DevOps'
+
+inputs:
+  ssh_key:
+    description: 'SSH private key for authentication'
+    required: true
+  ssh_host:
+    description: 'Nginx server hostname or IP'
+    required: true
+  ssh_user:
+    description: 'SSH username for deployment'
+    required: true
+  service_name:
+    description: 'Service name (used for Nginx config filename)'
+    required: true
+  backend_host:
+    description: 'Backend service host (localhost or IP)'
+    required: true
+  backend_port:
+    description: 'Backend service port'
+    required: true
+  domain:
+    description: 'FQDN domain (e.g., api.example.com)'
+    required: true
+  ssl_mode:
+    description: 'SSL mode: auto, renew, disable, self-signed'
+    required: false
+    default: 'auto'
+  force_ssl:
+    description: 'Force HTTPS redirect'
+    required: false
+    default: 'true'
+  force_reconfigure:
+    description: 'Force complete Nginx reconfiguration (removes existing config)'
+    required: false
+    default: 'false'
+  self_signed_passphrase:
+    description: 'Passphrase for self-signed certificate (.pfx)'
+    required: false
+    default: ''
+  skip_health_check:
+    description: 'Skip post-configuration health check'
+    required: false
+    default: 'false'
+
+outputs:
+  configuration_status:
+    description: 'Configuration status: success, failed'
+    value: ${{ steps.configure.outputs.status }}
+  ssl_enabled:
+    description: 'Whether SSL is enabled'
+    value: ${{ steps.ssl.outputs.enabled }}
+  certificate_expiry_days:
+    description: 'Days until certificate expiry'
+    value: ${{ steps.ssl.outputs.expiry_days }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure SSH key
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ inputs.ssh_key }}" > ~/.ssh/deploy_key_nginx
+        chmod 600 ~/.ssh/deploy_key_nginx
+        ssh-keyscan -H "${{ inputs.ssh_host }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+    - name: Install/Verify Nginx
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_nginx -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Verifying Nginx installation..."
+        if ! ssh_exec "command -v nginx &> /dev/null"; then
+          echo "Installing Nginx..."
+          ssh_exec "sudo apt-get update && sudo apt-get install -y nginx"
+          ssh_exec "sudo systemctl enable nginx && sudo systemctl start nginx"
+          echo "✓ Nginx installed"
+        else
+          echo "✓ Nginx already installed"
+        fi
+
+        if ! ssh_exec "systemctl is-active --quiet nginx"; then
+          echo "Starting Nginx..."
+          ssh_exec "sudo systemctl start nginx"
+        fi
+
+        echo "✓ Nginx is running"
+
+    - name: Configure Nginx reverse proxy
+      id: configure
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        SERVICE_NAME="${{ inputs.service_name }}"
+        BACKEND_HOST="${{ inputs.backend_host }}"
+        BACKEND_PORT="${{ inputs.backend_port }}"
+        DOMAIN="${{ inputs.domain }}"
+        FORCE_RECONFIG="${{ inputs.force_reconfigure }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_nginx -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        CONFIG_FILE="/etc/nginx/sites-available/$SERVICE_NAME"
+        ENABLED_LINK="/etc/nginx/sites-enabled/$SERVICE_NAME"
+        BACKEND_URL="http://${BACKEND_HOST}:${BACKEND_PORT}"
+
+        echo "Checking existing configuration..."
+        CONFIG_EXISTS=$(ssh_exec "[ -f '$CONFIG_FILE' ] && echo 'true' || echo 'false'")
+
+        if [ "$CONFIG_EXISTS" = "true" ] && [ "$FORCE_RECONFIG" != "true" ]; then
+          echo "Updating existing Nginx configuration..."
+
+          # Backup current config
+          BACKUP="/etc/nginx/sites-available/$SERVICE_NAME.backup.$(date +%Y%m%d_%H%M%S)"
+          ssh_exec "sudo cp $CONFIG_FILE $BACKUP"
+          echo "✓ Backup created: $BACKUP"
+
+          # Update proxy_pass directive
+          ssh_exec "sudo sed -i 's|proxy_pass\s\+http://[^:]\+:[0-9]\+|proxy_pass $BACKEND_URL|g' $CONFIG_FILE"
+          echo "✓ Updated backend URL to: $BACKEND_URL"
+
+          # Test Nginx configuration
+          if ssh_exec "sudo nginx -t 2>&1" | grep -q "syntax is ok"; then
+            ssh_exec "sudo systemctl reload nginx"
+            echo "✓ Nginx configuration updated and reloaded"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Nginx configuration test failed - restoring backup"
+            ssh_exec "sudo cp $BACKUP $CONFIG_FILE"
+            ssh_exec "sudo systemctl reload nginx"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          # Cleanup old backups (keep last 5)
+          ssh_exec "ls -t /etc/nginx/sites-available/$SERVICE_NAME.backup.* 2>/dev/null | tail -n +6 | xargs -r sudo rm -f" || true
+
+        else
+          if [ "$FORCE_RECONFIG" = "true" ]; then
+            echo "Force reconfigure - removing existing configuration..."
+            ssh_exec "sudo rm -f $CONFIG_FILE $ENABLED_LINK" || true
+          fi
+
+          echo "Creating new Nginx configuration..."
+
+          # Create temporary config file locally
+          rm -f /tmp/nginx_config_$SERVICE_NAME.conf
+
+          cat > /tmp/nginx_config_$SERVICE_NAME.conf <<'EOF'
+        # Nginx Reverse Proxy Configuration
+        # Service: SERVICE_NAME_PLACEHOLDER
+        # Managed by GitHub Actions - DO NOT EDIT MANUALLY
+        # Last updated: TIMESTAMP_PLACEHOLDER
+
+        server {
+            listen 80;
+            server_name DOMAIN_PLACEHOLDER;
+
+            # Logging
+            access_log /var/log/nginx/SERVICE_NAME_PLACEHOLDER_access.log;
+            error_log /var/log/nginx/SERVICE_NAME_PLACEHOLDER_error.log;
+
+            # Security headers
+            add_header X-Frame-Options "SAMEORIGIN" always;
+            add_header X-XSS-Protection "1; mode=block" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "no-referrer-when-downgrade" always;
+            add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;
+
+            # Proxy configuration
+            location / {
+                proxy_pass BACKEND_URL_PLACEHOLDER;
+                proxy_http_version 1.1;
+
+                # WebSocket support
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection keep-alive;
+
+                # Standard proxy headers
+                proxy_set_header Host $host;
+                proxy_cache_bypass $http_upgrade;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header X-Real-IP $remote_addr;
+
+                # Timeout settings
+                proxy_connect_timeout 60s;
+                proxy_send_timeout 60s;
+                proxy_read_timeout 60s;
+            }
+        }
+        EOF
+
+          # Replace placeholders
+          TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S UTC')
+          sed -i "s|SERVICE_NAME_PLACEHOLDER|$SERVICE_NAME|g" /tmp/nginx_config_$SERVICE_NAME.conf
+          sed -i "s|DOMAIN_PLACEHOLDER|$DOMAIN|g" /tmp/nginx_config_$SERVICE_NAME.conf
+          sed -i "s|BACKEND_URL_PLACEHOLDER|$BACKEND_URL|g" /tmp/nginx_config_$SERVICE_NAME.conf
+          sed -i "s|TIMESTAMP_PLACEHOLDER|$TIMESTAMP|g" /tmp/nginx_config_$SERVICE_NAME.conf
+
+          # Display generated config for verification
+          echo "Generated Nginx configuration:"
+          echo "========================================="
+          cat /tmp/nginx_config_$SERVICE_NAME.conf
+          echo "========================================="
+
+          # Transfer configuration to remote server
+          cat /tmp/nginx_config_$SERVICE_NAME.conf | ssh_exec "sudo tee $CONFIG_FILE > /dev/null"
+          rm -f /tmp/nginx_config_$SERVICE_NAME.conf
+
+          # Enable site (symlink to sites-enabled)
+          ssh_exec "sudo ln -sf $CONFIG_FILE $ENABLED_LINK"
+
+          # Test and reload Nginx
+          if ssh_exec "sudo nginx -t 2>&1" | grep -q "syntax is ok"; then
+            ssh_exec "sudo systemctl reload nginx"
+            echo "✓ New Nginx configuration created and enabled"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Nginx configuration test failed"
+            ssh_exec "sudo rm -f $CONFIG_FILE $ENABLED_LINK"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+        fi
+
+    - name: Configure SSL certificates
+      id: ssl
+      if: inputs.ssl_mode != 'disable'
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        DOMAIN="${{ inputs.domain }}"
+        SSL_MODE="${{ inputs.ssl_mode }}"
+        SERVICE_NAME="${{ inputs.service_name }}"
+        FORCE_SSL="${{ inputs.force_ssl }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_nginx -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "SSL Mode: $SSL_MODE"
+
+        if [ "$SSL_MODE" = "self-signed" ]; then
+          # ========================================
+          # Self-signed certificate with OpenSSL
+          # ========================================
+
+          CERT_DIR="/opt/$SERVICE_NAME/certs"
+          CERT_FILE="$CERT_DIR/$SERVICE_NAME.pfx"
+          PASSPHRASE="${{ inputs.self_signed_passphrase }}"
+          RENEWAL_THRESHOLD=30
+
+          if [ -z "$PASSPHRASE" ]; then
+            echo "❌ self_signed_passphrase is required for self-signed mode"
+            exit 1
+          fi
+
+          echo "Managing self-signed certificate..."
+
+          # Check if certificate exists and validity
+          NEEDS_RENEWAL="false"
+          CERT_EXISTS=$(ssh_exec "[ -f '$CERT_FILE' ] && echo 'true' || echo 'false'")
+
+          if [ "$CERT_EXISTS" = "true" ]; then
+            echo "Checking certificate expiry..."
+            DAYS_LEFT=$(ssh_exec "openssl pkcs12 -in '$CERT_FILE' -passin pass:'$PASSPHRASE' -nokeys 2>/dev/null | openssl x509 -enddate -noout 2>/dev/null | cut -d= -f2 | xargs -I{} date -d {} +%s 2>/dev/null | xargs -I{} expr \( {} - \$(date +%s) \) / 86400 2>/dev/null" || echo "0")
+
+            echo "Certificate expires in $DAYS_LEFT days"
+            echo "expiry_days=$DAYS_LEFT" >> $GITHUB_OUTPUT
+
+            if [ "$DAYS_LEFT" -lt "$RENEWAL_THRESHOLD" ]; then
+              echo "Certificate expires in less than $RENEWAL_THRESHOLD days - renewal needed"
+              NEEDS_RENEWAL="true"
+            else
+              echo "✓ Certificate is valid for $DAYS_LEFT days"
+            fi
+          else
+            echo "No certificate found - generation needed"
+            NEEDS_RENEWAL="true"
+          fi
+
+          # Generate or renew certificate
+          if [ "$NEEDS_RENEWAL" = "true" ] || [ "$SSL_MODE" = "renew" ]; then
+            echo "Generating self-signed certificate..."
+
+            # Create certificate generation script
+            cat > /tmp/generate_cert.sh <<'CERTSCRIPT'
+        #!/bin/bash
+        set -e
+
+        CERT_DIR="$1"
+        CERT_FILE="$2"
+        PASSPHRASE="$3"
+        DOMAIN="$4"
+
+        # Create directory if not exists
+        mkdir -p "$CERT_DIR"
+        cd "$CERT_DIR"
+
+        # Generate private key and self-signed certificate (valid for 365 days)
+        openssl req -x509 -newkey rsa:4096 -sha256 -days 365 \
+          -nodes -keyout temp_$$.key -out temp_$$.crt \
+          -subj "/CN=$DOMAIN/O=DiemmeGroup/C=IT" \
+          -addext "subjectAltName=DNS:$DOMAIN,DNS:*.$DOMAIN"
+
+        # Create PKCS#12 (.pfx) bundle
+        openssl pkcs12 -export -out "$CERT_FILE" \
+          -inkey temp_$$.key -in temp_$$.crt \
+          -passout pass:"$PASSPHRASE"
+
+        # Cleanup temporary files
+        rm -f temp_$$.key temp_$$.crt
+
+        # Set restrictive permissions
+        chmod 600 "$CERT_FILE"
+
+        echo "✓ Certificate generated: $CERT_FILE"
+        openssl pkcs12 -in "$CERT_FILE" -passin pass:"$PASSPHRASE" -nokeys | openssl x509 -noout -dates
+        CERTSCRIPT
+
+            # Transfer script and execute on remote server
+            cat /tmp/generate_cert.sh | ssh_exec "cat > /tmp/generate_cert_$$.sh && chmod +x /tmp/generate_cert_$$.sh"
+            ssh_exec "sudo /tmp/generate_cert_$$.sh '$CERT_DIR' '$CERT_FILE' '$PASSPHRASE' '$DOMAIN'"
+            ssh_exec "rm -f /tmp/generate_cert_$$.sh"
+            rm -f /tmp/generate_cert.sh
+
+            echo "✓ Self-signed certificate generated"
+            echo "enabled=true" >> $GITHUB_OUTPUT
+            echo "expiry_days=365" >> $GITHUB_OUTPUT
+          else
+            echo "enabled=true" >> $GITHUB_OUTPUT
+          fi
+
+          # Setup automatic renewal cron job
+          echo "Setting up automatic certificate renewal..."
+
+          RENEWAL_SCRIPT="/opt/$SERVICE_NAME/scripts/renew-cert.sh"
+
+          # Create renewal script
+          cat > /tmp/renew_cert.sh <<RENEWSCRIPT
+        #!/bin/bash
+        # Auto-renewal script for self-signed certificate
+        # Service: $SERVICE_NAME
+
+        CERT_DIR="$CERT_DIR"
+        CERT_FILE="$CERT_FILE"
+        PASSPHRASE="$PASSPHRASE"
+        DOMAIN="$DOMAIN"
+        THRESHOLD=30
+
+        # Check expiry
+        DAYS_LEFT=\$(openssl pkcs12 -in "\$CERT_FILE" -passin pass:"\$PASSPHRASE" -nokeys 2>/dev/null | openssl x509 -enddate -noout 2>/dev/null | cut -d= -f2 | xargs -I{} date -d {} +%s 2>/dev/null | xargs -I{} expr \( {} - \$(date +%s) \) / 86400 2>/dev/null || echo "0")
+
+        if [ "\$DAYS_LEFT" -lt "\$THRESHOLD" ]; then
+          echo "Certificate expires in \$DAYS_LEFT days - renewing..."
+
+          cd "\$CERT_DIR"
+
+          # Generate new certificate
+          openssl req -x509 -newkey rsa:4096 -sha256 -days 365 \
+            -nodes -keyout temp.key -out temp.crt \
+            -subj "/CN=\$DOMAIN/O=DiemmeGroup/C=IT" \
+            -addext "subjectAltName=DNS:\$DOMAIN,DNS:*.\$DOMAIN"
+
+          openssl pkcs12 -export -out "\$CERT_FILE" \
+            -inkey temp.key -in temp.crt \
+            -passout pass:"\$PASSPHRASE"
+
+          rm -f temp.key temp.crt
+          chmod 600 "\$CERT_FILE"
+
+          echo "✓ Certificate renewed successfully"
+        else
+          echo "Certificate valid for \$DAYS_LEFT days - no renewal needed"
+        fi
+        RENEWSCRIPT
+
+          # Transfer renewal script
+          cat /tmp/renew_cert.sh | ssh_exec "sudo mkdir -p /opt/$SERVICE_NAME/scripts && sudo tee $RENEWAL_SCRIPT > /dev/null"
+          ssh_exec "sudo chmod +x $RENEWAL_SCRIPT"
+          rm -f /tmp/renew_cert.sh
+
+          # Setup cron job (daily at 2 AM)
+          CRON_CMD="0 2 * * * root $RENEWAL_SCRIPT >> /var/log/$SERVICE_NAME-cert-renewal.log 2>&1"
+
+          if ! ssh_exec "grep -q '$RENEWAL_SCRIPT' /etc/crontab 2>/dev/null"; then
+            ssh_exec "echo '$CRON_CMD' | sudo tee -a /etc/crontab > /dev/null"
+            echo "✓ Auto-renewal cron job configured"
+          else
+            echo "✓ Auto-renewal cron job already configured"
+          fi
+
+        else
+          # ========================================
+          # Let's Encrypt with certbot
+          # ========================================
+
+          echo "Managing Let's Encrypt certificate..."
+
+          # Install certbot if needed
+          if ! ssh_exec "command -v certbot &> /dev/null"; then
+            echo "Installing certbot..."
+            ssh_exec "sudo apt-get update && sudo apt-get install -y certbot python3-certbot-nginx"
+            echo "✓ Certbot installed"
+          fi
+
+          CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+          CERT_EXISTS=$(ssh_exec "[ -f '$CERT_PATH' ] && echo 'true' || echo 'false'")
+
+          if [ "$SSL_MODE" = "renew" ]; then
+            echo "Forcing certificate renewal..."
+            ssh_exec "sudo certbot renew --nginx -d $DOMAIN --force-renewal --non-interactive"
+            echo "✓ Certificate renewed"
+            echo "enabled=true" >> $GITHUB_OUTPUT
+            echo "expiry_days=90" >> $GITHUB_OUTPUT
+
+          elif [ "$CERT_EXISTS" = "true" ]; then
+            # Check certificate expiry
+            DAYS_LEFT=$(ssh_exec "openssl x509 -enddate -noout -in $CERT_PATH | cut -d= -f2 | xargs -I{} date -d {} +%s | xargs -I{} expr \( {} - \$(date +%s) \) / 86400" || echo "0")
+            echo "Certificate expires in $DAYS_LEFT days"
+            echo "expiry_days=$DAYS_LEFT" >> $GITHUB_OUTPUT
+
+            if [ "$DAYS_LEFT" -gt 30 ]; then
+              echo "✓ Valid certificate exists"
+
+              # Ensure HTTPS is configured in Nginx
+              CONFIG_FILE="/etc/nginx/sites-available/$SERVICE_NAME"
+              if ! ssh_exec "grep -q 'listen 443 ssl' $CONFIG_FILE 2>/dev/null"; then
+                echo "Applying HTTPS configuration to Nginx..."
+                ssh_exec "sudo certbot install --nginx -d $DOMAIN --non-interactive"
+              fi
+
+              echo "enabled=true" >> $GITHUB_OUTPUT
+            else
+              echo "Certificate expires soon - renewing..."
+              ssh_exec "sudo certbot renew --nginx -d $DOMAIN --non-interactive"
+              echo "✓ Certificate renewed"
+              echo "enabled=true" >> $GITHUB_OUTPUT
+            fi
+
+          else
+            echo "No certificate found - requesting new certificate..."
+            echo "⚠️  Ensure DNS for $DOMAIN points to this server before proceeding!"
+
+            # Request new certificate with automatic Nginx configuration
+            if ssh_exec "sudo certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@$DOMAIN --redirect"; then
+              echo "✓ SSL certificate obtained and configured"
+              echo "enabled=true" >> $GITHUB_OUTPUT
+              echo "expiry_days=90" >> $GITHUB_OUTPUT
+            else
+              echo "❌ SSL certificate request failed"
+              echo "enabled=false" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          fi
+
+          # Setup auto-renewal cron job
+          if ! ssh_exec "grep -q 'certbot renew' /etc/crontab 2>/dev/null"; then
+            ssh_exec "echo '0 3 * * * root certbot renew --quiet --deploy-hook \"systemctl reload nginx\"' | sudo tee -a /etc/crontab > /dev/null"
+            echo "✓ Auto-renewal cron job configured"
+          else
+            echo "✓ Auto-renewal cron job already configured"
+          fi
+        fi
+
+        # Force SSL redirect if requested
+        if [ "$FORCE_SSL" = "true" ] && [ "$SSL_MODE" != "disable" ]; then
+          echo "Ensuring HTTPS redirect is enabled..."
+          CONFIG_FILE="/etc/nginx/sites-available/$SERVICE_NAME"
+
+          # Check if redirect is already configured
+          if ! ssh_exec "grep -q 'return 301 https' $CONFIG_FILE 2>/dev/null"; then
+            echo "Adding HTTPS redirect..."
+            # This will be handled by certbot for Let's Encrypt
+            # For self-signed, we'll add manual redirect
+            if [ "$SSL_MODE" = "self-signed" ]; then
+              echo "⚠️  Note: Manual HTTPS redirect configuration may be needed for self-signed certificates"
+            fi
+          fi
+        fi
+
+    - name: Backend health verification
+      if: inputs.skip_health_check != 'true'
+      shell: bash
+      run: |
+        SSH_HOST="${{ inputs.ssh_host }}"
+        SSH_USER="${{ inputs.ssh_user }}"
+        BACKEND_HOST="${{ inputs.backend_host }}"
+        BACKEND_PORT="${{ inputs.backend_port }}"
+        SSL_MODE="${{ inputs.ssl_mode }}"
+
+        ssh_exec() {
+          ssh -i ~/.ssh/deploy_key_nginx -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+        }
+
+        echo "Waiting for services to stabilize..."
+        sleep 5
+
+        # Test backend directly
+        echo "Testing backend at http://${BACKEND_HOST}:${BACKEND_PORT}..."
+        if ssh_exec "curl -f -s -o /dev/null -w '%{http_code}' http://${BACKEND_HOST}:${BACKEND_PORT}"; then
+          echo "✓ Backend is responding"
+        else
+          echo "⚠️  Backend health check failed - service may still be starting"
+        fi
+
+        # Test Nginx HTTP endpoint
+        echo "Testing Nginx HTTP endpoint..."
+        HTTP_CODE=$(ssh_exec "curl -s -o /dev/null -w '%{http_code}' http://localhost" || echo "000")
+
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "301" ] || [ "$HTTP_CODE" = "302" ]; then
+          echo "✓ Nginx HTTP endpoint responding (HTTP $HTTP_CODE)"
+        else
+          echo "❌ Nginx HTTP endpoint not responding properly (HTTP $HTTP_CODE)"
+          ssh_exec "sudo nginx -T 2>&1 | tail -20" || true
+          exit 1
+        fi
+
+        # Test HTTPS if SSL is enabled
+        if [ "$SSL_MODE" != "disable" ]; then
+          echo "Testing Nginx HTTPS endpoint..."
+          HTTPS_CODE=$(ssh_exec "curl -k -s -o /dev/null -w '%{http_code}' https://localhost" || echo "000")
+
+          if [ "$HTTPS_CODE" = "200" ] || [ "$HTTPS_CODE" = "301" ] || [ "$HTTPS_CODE" = "302" ]; then
+            echo "✓ Nginx HTTPS endpoint responding (HTTP $HTTPS_CODE)"
+          else
+            echo "⚠️  HTTPS endpoint check: HTTP $HTTPS_CODE (may not be configured yet)"
+          fi
+        fi
+
+        echo "✓ Health check completed"
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        rm -f ~/.ssh/deploy_key_nginx
+        echo "✓ Cleaned up SSH keys"

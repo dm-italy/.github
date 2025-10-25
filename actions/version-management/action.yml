@@ -1,0 +1,244 @@
+name: 'Semantic Version Management'
+description: 'Manage semantic versioning with standard-version, changelog generation, and git tag handling'
+author: 'DiemmeGroup DevOps'
+
+inputs:
+  working_directory:
+    description: 'Working directory for the project (e.g., apps/factory)'
+    required: false
+    default: '.'
+  node_version:
+    description: 'Node.js version for standard-version'
+    required: false
+    default: '20.x'
+  tag_prefix:
+    description: 'Custom tag prefix (e.g., factory-app@, quality-service@, etc.)'
+    required: false
+    default: ''
+  skip_version_bump:
+    description: 'Skip version bump (use current version)'
+    required: false
+    default: 'false'
+  skip_tag_push:
+    description: 'Skip pushing tags to remote'
+    required: false
+    default: 'false'
+  git_branch:
+    description: 'Git branch to push to'
+    required: false
+    default: 'update'
+  cleanup_unpushed_tags:
+    description: 'Cleanup unpushed tags before versioning'
+    required: false
+    default: 'true'
+  git_user_name:
+    description: 'Git user name for commits'
+    required: false
+    default: 'gitbot'
+  git_user_email:
+    description: 'Git user email for commits'
+    required: false
+    default: 'gitbot@dmconsulting.it'
+  github_token:
+    description: 'GitHub token for npm registry authentication'
+    required: false
+    default: ''
+  release_script:
+    description: 'Custom release script command (e.g., "yarn release" or "npm run release")'
+    required: false
+    default: 'npx standard-version'
+
+outputs:
+  new_version:
+    description: 'New version after bump (e.g., 1.2.3)'
+    value: ${{ steps.version.outputs.new_version }}
+  version_changed:
+    description: 'Whether version was changed (true/false)'
+    value: ${{ steps.version.outputs.version_changed }}
+  changelog:
+    description: 'Changelog excerpt for this version'
+    value: ${{ steps.version.outputs.changelog }}
+  current_version:
+    description: 'Current version before bump'
+    value: ${{ steps.current.outputs.current_full }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Git
+      shell: bash
+      run: |
+        git config --global user.email "${{ inputs.git_user_email }}"
+        git config --global user.name "${{ inputs.git_user_name }}"
+        echo "✓ Git configured as ${{ inputs.git_user_name }}"
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: Create .npmrc for GitHub Packages
+      if: inputs.github_token != ''
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        echo "Creating .npmrc for GitHub Packages access..."
+        cat > .npmrc <<EOF
+        @dm-italy:registry=https://npm.pkg.github.com
+        //npm.pkg.github.com/:_authToken=${{ inputs.github_token }}
+        EOF
+        echo "✓ .npmrc created successfully"
+
+    - name: Cleanup unpushed tags
+      if: inputs.cleanup_unpushed_tags == 'true'
+      shell: bash
+      run: |
+        echo "Identifying and removing unpushed tags..."
+
+        # Get all local tags
+        local_tags=$(git tag)
+
+        # Get all remote tags (store in variable to avoid repeated remote calls)
+        remote_tags=$(git ls-remote --tags origin | cut -d/ -f3)
+
+        # Find tags that exist only locally
+        unpushed_tags=""
+        for tag in $local_tags; do
+          # Use grep with || true to prevent SIGPIPE errors
+          if ! grep -q "^${tag}$" <<< "$remote_tags" 2>/dev/null; then
+            unpushed_tags="$unpushed_tags $tag"
+          fi
+        done
+
+        if [ -n "$unpushed_tags" ]; then
+          echo "Unpushed tags found: $unpushed_tags"
+          for tag in $unpushed_tags; do
+            echo "Deleting local tag: $tag"
+            git tag -d $tag
+          done
+          echo "✓ All unpushed tags have been deleted."
+        else
+          echo "✓ No unpushed tags found."
+        fi
+
+    - name: Get current version
+      id: current
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        CURRENT_FULL=$(npm pkg get version | tr -d '"' || echo "0.0.0")
+        echo "current_full=$CURRENT_FULL" >> $GITHUB_OUTPUT
+        echo "Current version: $CURRENT_FULL"
+
+    - name: Install standard-version
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        echo "Installing standard-version..."
+        yarn add standard-version
+        echo "✓ standard-version installed successfully"
+
+    - name: Run standard-version
+      id: version
+      if: inputs.skip_version_bump != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        # Check if version will change using dry-run
+        if ${{ inputs.release_script }} --dry-run 2>&1 | grep -q "bumping version"; then
+          echo "✓ Version will be bumped"
+
+          # Run standard-version with --skip.tag (we'll create tag manually with --force)
+          ${{ inputs.release_script }} --skip.tag
+
+          NEW_VERSION=$(npm pkg get version | tr -d '"')
+
+          echo "version_changed=true" >> $GITHUB_OUTPUT
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "✓ New version: $NEW_VERSION"
+
+          # Extract changelog for this version
+          if [ -f CHANGELOG.md ]; then
+            CHANGELOG=$(awk '/^## \[/{if(++count==2)exit}count==1' CHANGELOG.md)
+            echo "changelog<<EOF" >> $GITHUB_OUTPUT
+            echo "$CHANGELOG" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "changelog=No changelog available" >> $GITHUB_OUTPUT
+          fi
+
+          # Determine tag name
+          TAG_NAME="${{ inputs.tag_prefix }}$NEW_VERSION"
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+
+          # Create tag manually with --force to overwrite if exists
+          echo "Creating tag: $TAG_NAME"
+          git tag -f -a "$TAG_NAME" -m "chore(release): $NEW_VERSION"
+          echo "✓ Tag created: $TAG_NAME"
+        else
+          echo "ℹ No version bump needed (no feat/fix/breaking changes)"
+          CURRENT_VERSION="${{ steps.current.outputs.current_full }}"
+
+          echo "version_changed=false" >> $GITHUB_OUTPUT
+          echo "new_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "changelog=No changes to release" >> $GITHUB_OUTPUT
+
+          # Use current version for tag
+          TAG_NAME="${{ inputs.tag_prefix }}$CURRENT_VERSION"
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Set version for skipped bump
+      if: inputs.skip_version_bump == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        CURRENT_VERSION="${{ steps.current.outputs.current_full }}"
+        echo "version_changed=false" >> $GITHUB_OUTPUT
+        echo "new_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+        echo "changelog=Build without version bump" >> $GITHUB_OUTPUT
+        echo "Using version: $CURRENT_VERSION (no version bump)"
+
+    - name: Push branch and tags
+      if: inputs.skip_tag_push != 'true' && steps.version.outputs.version_changed == 'true'
+      shell: bash
+      run: |
+        TAG_NAME="${{ steps.version.outputs.tag_name }}"
+        echo "Pushing branch and new tag: $TAG_NAME"
+
+        # Push the branch first
+        git push origin ${{ inputs.git_branch }}
+
+        # Push only the new tag (with --force in case it exists remotely)
+        git push origin "refs/tags/$TAG_NAME" --force
+
+        echo "✓ Branch and tag pushed successfully"
+
+    - name: Display version summary
+      shell: bash
+      run: |
+        echo ""
+        echo "## 📦 Version Management Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Current Version:** ${{ steps.current.outputs.current_full }}" >> $GITHUB_STEP_SUMMARY
+        echo "**New Version:** ${{ steps.version.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Version Changed:** ${{ steps.version.outputs.version_changed }}" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ steps.version.outputs.version_changed }}" = "true" ]; then
+          echo "**Tag:** ${{ steps.version.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.skip_version_bump }}" = "true" ]; then
+          echo "ℹ️ Version bump was skipped" >> $GITHUB_STEP_SUMMARY
+        elif [ "${{ steps.version.outputs.version_changed }}" = "true" ]; then
+          echo "✓ Version bumped and changes committed" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "ℹ️ No version bump needed (no feat/fix/breaking changes)" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Changelog" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "${{ steps.version.outputs.changelog }}" >> $GITHUB_STEP_SUMMARY

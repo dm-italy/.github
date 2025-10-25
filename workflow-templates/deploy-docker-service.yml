@@ -1,0 +1,64 @@
+name: Deploy Docker Service
+
+on:
+  push:
+    branches: [update]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and Push Docker Image
+        id: docker-build
+        uses: dm-italy/.github/actions/build-docker-image@main
+        with:
+          context_path: '.'  # ⬅️ Customize: Docker build context
+          dockerfile_path: './Dockerfile'  # ⬅️ Customize: path to Dockerfile
+          image_name: 'my-service'  # ⬅️ Customize: your image name
+          image_tags: 'latest,${{ github.sha }}'
+          registry_url: 'ghcr.io'
+          repository_owner: 'dm-italy'
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+          platforms: 'linux/amd64'
+          push: 'true'
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy Docker Container
+        uses: dm-italy/.github/actions/deploy-docker@main
+        with:
+          ssh_key: ${{ secrets.SSH_KEY }}
+          ssh_host: ${{ secrets.SSH_HOST }}
+          ssh_user: ${{ secrets.SSH_USER }}
+          docker_image: 'ghcr.io/dm-italy/my-service:latest'  # ⬅️ Customize: match image from build
+          container_name: 'my-service'  # ⬅️ Customize: container name
+          host_port: 8080  # ⬅️ Customize: external port
+          container_port: 80  # ⬅️ Customize: internal container port
+          environment_vars: |
+            {
+              "ASPNETCORE_ENVIRONMENT": "Production",
+              "ConnectionStrings__Default": "${{ secrets.DB_CONNECTION_STRING }}"
+            }
+          registry_url: 'ghcr.io'
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+          restart_policy: 'unless-stopped'
+          docker_network: 'factory-network'
+
+      - name: Configure Nginx
+        uses: dm-italy/.github/actions/deploy-nginx@main
+        with:
+          ssh_key: ${{ secrets.SSH_KEY }}
+          ssh_host: ${{ secrets.SSH_HOST }}
+          ssh_user: ${{ secrets.SSH_USER }}
+          service_name: 'my-service'  # ⬅️ Match container name
+          backend_host: 'localhost'
+          backend_port: 8080  # ⬅️ Match host_port
+          domain: 'service.example.com'  # ⬅️ Customize: your domain
+          ssl_mode: 'auto'
