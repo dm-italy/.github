@@ -51,13 +51,13 @@ inputs:
 outputs:
   new_version:
     description: 'New version after bump (e.g., 1.2.3)'
-    value: ${{ steps.version.outputs.new_version }}
+    value: ${{ steps.version.outputs.new_version || steps.version-fallback.outputs.new_version }}
   version_changed:
     description: 'Whether version was changed (true/false)'
-    value: ${{ steps.version.outputs.version_changed }}
+    value: ${{ steps.version.outputs.version_changed || steps.version-fallback.outputs.version_changed }}
   changelog:
     description: 'Changelog excerpt for this version'
-    value: ${{ steps.version.outputs.changelog }}
+    value: ${{ steps.version.outputs.changelog || steps.version-fallback.outputs.changelog }}
   current_version:
     description: 'Current version before bump'
     value: ${{ steps.current.outputs.current_full }}
@@ -72,13 +72,27 @@ runs:
         git config --global user.name "${{ inputs.git_user_name }}"
         echo "✓ Git configured as ${{ inputs.git_user_name }}"
 
+    - name: Check if package.json exists
+      id: check-npm
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        if [ -f "package.json" ]; then
+          echo "has-npm=true" >> $GITHUB_OUTPUT
+          echo "✓ package.json found"
+        else
+          echo "has-npm=false" >> $GITHUB_OUTPUT
+          echo "⚠️ package.json not found - will use fallback version"
+        fi
+
     - name: Setup Node.js
+      if: steps.check-npm.outputs.has-npm == 'true'
       uses: actions/setup-node@v4
       with:
         node-version: ${{ inputs.node_version }}
 
     - name: Create .npmrc for GitHub Packages
-      if: inputs.github_token != ''
+      if: inputs.github_token != '' && steps.check-npm.outputs.has-npm == 'true'
       shell: bash
       working-directory: ${{ inputs.working_directory }}
       run: |
@@ -126,21 +140,26 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working_directory }}
       run: |
-        CURRENT_FULL=$(npm pkg get version | tr -d '"' || echo "0.0.0")
+        if [ "${{ steps.check-npm.outputs.has-npm }}" = "true" ]; then
+          CURRENT_FULL=$(npm pkg get version | tr -d '"' || echo "1.0.0")
+        else
+          CURRENT_FULL="1.0.0"
+        fi
         echo "current_full=$CURRENT_FULL" >> $GITHUB_OUTPUT
         echo "Current version: $CURRENT_FULL"
 
-    - name: Install standard-version
+    - name: Install npm dependencies
+      if: steps.check-npm.outputs.has-npm == 'true'
       shell: bash
       working-directory: ${{ inputs.working_directory }}
       run: |
-        echo "Installing standard-version..."
-        yarn add standard-version
-        echo "✓ standard-version installed successfully"
+        echo "Installing npm dependencies..."
+        npm install
+        echo "✓ npm dependencies installed successfully"
 
     - name: Run standard-version
       id: version
-      if: inputs.skip_version_bump != 'true'
+      if: inputs.skip_version_bump != 'true' && steps.check-npm.outputs.has-npm == 'true'
       shell: bash
       working-directory: ${{ inputs.working_directory }}
       run: |
@@ -188,16 +207,23 @@ runs:
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
         fi
 
-    - name: Set version for skipped bump
-      if: inputs.skip_version_bump == 'true'
+    - name: Set version for skipped bump or no package.json
+      id: version-fallback
+      if: inputs.skip_version_bump == 'true' || steps.check-npm.outputs.has-npm != 'true'
       shell: bash
       working-directory: ${{ inputs.working_directory }}
       run: |
         CURRENT_VERSION="${{ steps.current.outputs.current_full }}"
         echo "version_changed=false" >> $GITHUB_OUTPUT
         echo "new_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-        echo "changelog=Build without version bump" >> $GITHUB_OUTPUT
-        echo "Using version: $CURRENT_VERSION (no version bump)"
+
+        if [ "${{ steps.check-npm.outputs.has-npm }}" != "true" ]; then
+          echo "changelog=No package.json found - using fallback version" >> $GITHUB_OUTPUT
+          echo "Using fallback version: $CURRENT_VERSION (no package.json)"
+        else
+          echo "changelog=Build without version bump" >> $GITHUB_OUTPUT
+          echo "Using version: $CURRENT_VERSION (no version bump)"
+        fi
 
     - name: Push branch and tags
       if: inputs.skip_tag_push != 'true' && steps.version.outputs.version_changed == 'true'
@@ -217,22 +243,30 @@ runs:
     - name: Display version summary
       shell: bash
       run: |
+        # Determine which step provided the version outputs
+        NEW_VERSION="${{ steps.version.outputs.new_version || steps.version-fallback.outputs.new_version }}"
+        VERSION_CHANGED="${{ steps.version.outputs.version_changed || steps.version-fallback.outputs.version_changed }}"
+        CHANGELOG="${{ steps.version.outputs.changelog || steps.version-fallback.outputs.changelog }}"
+        TAG_NAME="${{ steps.version.outputs.tag_name }}"
+
         echo ""
         echo "## 📦 Version Management Summary" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**Current Version:** ${{ steps.current.outputs.current_full }}" >> $GITHUB_STEP_SUMMARY
-        echo "**New Version:** ${{ steps.version.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
-        echo "**Version Changed:** ${{ steps.version.outputs.version_changed }}" >> $GITHUB_STEP_SUMMARY
+        echo "**New Version:** $NEW_VERSION" >> $GITHUB_STEP_SUMMARY
+        echo "**Version Changed:** $VERSION_CHANGED" >> $GITHUB_STEP_SUMMARY
 
-        if [ "${{ steps.version.outputs.version_changed }}" = "true" ]; then
-          echo "**Tag:** ${{ steps.version.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+        if [ "$VERSION_CHANGED" = "true" ]; then
+          echo "**Tag:** $TAG_NAME" >> $GITHUB_STEP_SUMMARY
         fi
 
         echo "" >> $GITHUB_STEP_SUMMARY
 
         if [ "${{ inputs.skip_version_bump }}" = "true" ]; then
           echo "ℹ️ Version bump was skipped" >> $GITHUB_STEP_SUMMARY
-        elif [ "${{ steps.version.outputs.version_changed }}" = "true" ]; then
+        elif [ "${{ steps.check-npm.outputs.has-npm }}" != "true" ]; then
+          echo "ℹ️ No package.json found - using fallback version" >> $GITHUB_STEP_SUMMARY
+        elif [ "$VERSION_CHANGED" = "true" ]; then
           echo "✓ Version bumped and changes committed" >> $GITHUB_STEP_SUMMARY
         else
           echo "ℹ️ No version bump needed (no feat/fix/breaking changes)" >> $GITHUB_STEP_SUMMARY
@@ -241,4 +275,4 @@ runs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Changelog" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "${{ steps.version.outputs.changelog }}" >> $GITHUB_STEP_SUMMARY
+        echo "$CHANGELOG" >> $GITHUB_STEP_SUMMARY
