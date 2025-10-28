@@ -48,7 +48,7 @@ outputs:
     value: ${{ steps.create.outputs.id }}
   release_url:
     description: 'URL of the created release'
-    value: ${{ steps.create.outputs.html_url }}
+    value: ${{ steps.create.outputs.url }}
   release_upload_url:
     description: 'Upload URL for release assets'
     value: ${{ steps.create.outputs.upload_url }}
@@ -56,13 +56,34 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: Generate release date
+      id: release_date
+      shell: bash
+      run: echo "date=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+
+    - name: Extract changelog
+      id: changelog
+      shell: bash
+      run: |
+        if [ -f "CHANGELOG.md" ]; then
+          # Extract the latest version's changelog
+          CHANGELOG=$(awk '/^## \[/{if(++count==2)exit}count==1' CHANGELOG.md || cat CHANGELOG.md)
+          {
+            echo "changelog<<EOF"
+            echo "$CHANGELOG"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+        else
+          echo "changelog=Release ${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+        fi
+
     - name: Prepare release metadata
       id: prepare
       shell: bash
       run: |
         TAG_NAME="${{ inputs.tag_name }}"
         RELEASE_NAME="${{ inputs.release_name }}"
-        BODY="${{ inputs.body }}"
+        CUSTOM_BODY="${{ inputs.body }}"
 
         # Use tag name as release name if not provided
         if [ -z "$RELEASE_NAME" ]; then
@@ -72,22 +93,25 @@ runs:
         echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
         echo "Release name: $RELEASE_NAME"
 
-        # Prepare release body
-        RELEASE_BODY=""
+        # Build structured release body
+        RELEASE_BODY="# $RELEASE_NAME\n\n"
+        RELEASE_BODY="${RELEASE_BODY}**Release Date:** ${{ steps.release_date.outputs.date }}\n"
+        RELEASE_BODY="${RELEASE_BODY}**Commit:** ${{ github.sha }}\n"
+        RELEASE_BODY="${RELEASE_BODY}**Branch:** ${{ github.ref_name }}\n\n"
+
+        # Add changelog section
+        RELEASE_BODY="${RELEASE_BODY}${{ steps.changelog.outputs.changelog }}\n\n"
 
         # Add custom body if provided
-        if [ -n "$BODY" ]; then
-          RELEASE_BODY="$BODY"
+        if [ -n "$CUSTOM_BODY" ]; then
+          RELEASE_BODY="${RELEASE_BODY}${CUSTOM_BODY}\n\n"
         fi
 
         # Add Docker images section if provided
         DOCKER_IMAGES='${{ inputs.docker_images }}'
         if [ "$DOCKER_IMAGES" != "[]" ]; then
-          if [ -n "$RELEASE_BODY" ]; then
-            RELEASE_BODY="$RELEASE_BODY\n\n"
-          fi
-
           RELEASE_BODY="${RELEASE_BODY}## 🐳 Docker Images\n\n"
+          RELEASE_BODY="${RELEASE_BODY}This release includes the following Docker images:\n\n"
 
           # Parse JSON array and add each image
           echo "$DOCKER_IMAGES" | jq -r '.[]' | while read -r image; do
@@ -96,17 +120,15 @@ runs:
 
           RELEASE_BODY="${RELEASE_BODY}\n**Pull command:**\n\`\`\`bash\n"
           FIRST_IMAGE=$(echo "$DOCKER_IMAGES" | jq -r '.[0]')
-          RELEASE_BODY="${RELEASE_BODY}docker pull $FIRST_IMAGE\n\`\`\`"
+          RELEASE_BODY="${RELEASE_BODY}docker pull $FIRST_IMAGE\n\`\`\`\n\n"
         fi
 
         # Add comparison link if previous tag provided
         if [ -n "${{ inputs.previous_tag }}" ]; then
-          if [ -n "$RELEASE_BODY" ]; then
-            RELEASE_BODY="$RELEASE_BODY\n\n"
-          fi
+          RELEASE_BODY="${RELEASE_BODY}---\n\n"
           RELEASE_BODY="${RELEASE_BODY}**Full Changelog**: "
           RELEASE_BODY="${RELEASE_BODY}[${{ inputs.previous_tag }}...$TAG_NAME]"
-          RELEASE_BODY="${RELEASE_BODY}(${{ github.server_url }}/${{ github.repository }}/compare/${{ inputs.previous_tag }}...$TAG_NAME)"
+          RELEASE_BODY="${RELEASE_BODY}(${{ github.server_url }}/${{ github.repository }}/compare/${{ inputs.previous_tag }}...$TAG_NAME)\n"
         fi
 
         # Save to output (escape newlines for GitHub Actions)
@@ -164,47 +186,35 @@ runs:
 
     - name: Create GitHub Release
       id: create
-      uses: actions/create-release@v1
+      uses: softprops/action-gh-release@v1
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
       with:
         tag_name: ${{ inputs.tag_name }}
-        release_name: ${{ steps.prepare.outputs.release_name }}
+        name: ${{ steps.prepare.outputs.release_name }}
         body: ${{ steps.prepare.outputs.release_body }}
-        draft: ${{ inputs.draft }}
-        prerelease: ${{ inputs.prerelease }}
+        draft: ${{ inputs.draft == 'true' }}
+        prerelease: ${{ inputs.prerelease == 'true' }}
+        generate_release_notes: ${{ inputs.generate_release_notes == 'true' }}
+        files: |
+          *.zip
 
-    - name: Upload release artifacts
-      if: inputs.artifacts != '' && steps.artifacts.outputs.artifact_files != ''
+    - name: Verify uploaded artifacts
+      if: inputs.artifacts != ''
       shell: bash
-      env:
-        GITHUB_TOKEN: ${{ inputs.github_token }}
       run: |
-        UPLOAD_URL="${{ steps.create.outputs.upload_url }}"
-        ARTIFACT_FILES="${{ steps.artifacts.outputs.artifact_files }}"
+        echo "✓ Artifacts uploaded via softprops/action-gh-release"
 
-        echo "Uploading artifacts to release..."
-
-        IFS=',' read -ra FILE_ARRAY <<< "$ARTIFACT_FILES"
-
-        for file in "${FILE_ARRAY[@]}"; do
-          file=$(echo "$file" | xargs)  # Trim whitespace
-
-          if [ -f "$file" ]; then
-            echo "Uploading: $file"
-
-            # Upload using GitHub CLI
-            gh release upload "${{ inputs.tag_name }}" "$file" \
-              --repo "${{ github.repository }}" \
-              --clobber
-
-            echo "  ✓ Uploaded: $file"
-          else
-            echo "  ⚠️ File not found: $file"
-          fi
-        done
-
-        echo "✓ All artifacts uploaded"
+        if [ -n "${{ steps.artifacts.outputs.artifact_files }}" ]; then
+          echo "Uploaded files:"
+          IFS=',' read -ra FILE_ARRAY <<< "${{ steps.artifacts.outputs.artifact_files }}"
+          for file in "${FILE_ARRAY[@]}"; do
+            file=$(echo "$file" | xargs)
+            if [ -f "$file" ]; then
+              echo "  ✓ $file"
+            fi
+          done
+        fi
 
     - name: Generate release summary
       shell: bash
@@ -214,7 +224,8 @@ runs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**Tag:** \`${{ inputs.tag_name }}\`" >> $GITHUB_STEP_SUMMARY
         echo "**Release Name:** ${{ steps.prepare.outputs.release_name }}" >> $GITHUB_STEP_SUMMARY
-        echo "**Release URL:** ${{ steps.create.outputs.html_url }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Release Date:** ${{ steps.release_date.outputs.date }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Release URL:** ${{ steps.create.outputs.url }}" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
         if [ "${{ inputs.draft }}" = "true" ]; then
@@ -256,7 +267,7 @@ runs:
 
         echo "---" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "View release: [${{ inputs.tag_name }}](${{ steps.create.outputs.html_url }})" >> $GITHUB_STEP_SUMMARY
+        echo "View release: [${{ inputs.tag_name }}](${{ steps.create.outputs.url }})" >> $GITHUB_STEP_SUMMARY
 
     - name: Cleanup
       if: always()
