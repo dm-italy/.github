@@ -72,6 +72,11 @@ runs:
         git config --global user.name "${{ inputs.git_user_name }}"
         echo "✓ Git configured as ${{ inputs.git_user_name }}"
 
+        # Fetch full git history for standard-version
+        echo "Fetching full git history..."
+        git fetch --unshallow --tags || git fetch --tags || true
+        echo "✓ Git history fetched"
+
     - name: Check and create package.json if needed
       id: check-npm
       shell: bash
@@ -150,17 +155,31 @@ runs:
         echo "current_full=$CURRENT_FULL" >> $GITHUB_OUTPUT
         echo "Current version: $CURRENT_FULL"
 
+        # Show recent commits for debugging
+        echo ""
+        echo "📜 Recent commits:"
+        git log --oneline -5 || true
+
     - name: Run standard-version
       id: version
       if: inputs.skip_version_bump != 'true'
       shell: bash
       working-directory: ${{ inputs.working_directory }}
       run: |
+        echo "🔍 Checking if version will change..."
+        echo "Running: ${{ inputs.release_script }} --dry-run"
+
+        # Capture dry-run output for debugging
+        DRY_RUN_OUTPUT=$(${{ inputs.release_script }} --dry-run 2>&1 || true)
+        echo "📋 Dry-run output:"
+        echo "$DRY_RUN_OUTPUT"
+
         # Check if version will change using dry-run
-        if ${{ inputs.release_script }} --dry-run 2>&1 | grep -q "bumping version"; then
+        if echo "$DRY_RUN_OUTPUT" | grep -q "bumping version"; then
           echo "✓ Version will be bumped"
 
           # Run standard-version with --skip.tag (we'll create tag manually with --force)
+          echo "🚀 Running: ${{ inputs.release_script }} --skip.tag"
           ${{ inputs.release_script }} --skip.tag
 
           NEW_VERSION=$(npm pkg get version | tr -d '"')
