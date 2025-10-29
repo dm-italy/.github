@@ -159,6 +159,17 @@ npx standard-version --skip.tag
 
 ## Errori comuni
 
+### Error: rawValue: command not found / MachineDeltaDataEto: command not found
+
+**Causa**: Il changelog contiene caratteri speciali che bash cerca di eseguire come comandi.
+
+**Soluzione**: ✅ Risolto dalla versione corrente. L'action ora usa heredoc con quote per prevenire command injection.
+
+Se usi una versione vecchia, aggiorna a:
+```yaml
+uses: dm-italy/github-dm-italy/actions/version-management@main
+```
+
 ### Error: No commits found
 
 **Causa**: Repository vuoto o nessun commit dopo l'ultimo tag.
