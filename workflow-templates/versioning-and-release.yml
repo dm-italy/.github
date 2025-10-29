@@ -5,6 +5,9 @@ on:
     branches: [main, update]
   workflow_dispatch:
 
+permissions:
+  contents: write  # Required for creating releases and pushing tags
+
 jobs:
   version:
     runs-on: ubuntu-latest

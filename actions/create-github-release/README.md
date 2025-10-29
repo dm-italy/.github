@@ -15,6 +15,15 @@ GitHub Action composita per creare release GitHub con artifacts, changelog autom
 
 ## 🚀 Quick Start
 
+### ⚠️ Requisiti
+
+Il workflow che usa questa action **DEVE** avere i permessi di scrittura:
+
+```yaml
+permissions:
+  contents: write  # Required for creating releases
+```
+
 ### Release base con changelog
 
 ```yaml
@@ -160,6 +169,9 @@ on:
   push:
     tags:
       - 'v*'
+
+permissions:
+  contents: write  # Required for creating releases
 
 jobs:
   build:
