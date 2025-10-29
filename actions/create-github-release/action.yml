@@ -121,15 +121,26 @@ runs:
           echo "This release includes the following Docker images:"
           echo ""
 
-          # Parse JSON array and add each image
-          echo "$DOCKER_IMAGES" | jq -r '.[]' | while read -r image; do
-            echo "- \`$image\`"
-          done
+          # Parse JSON array without jq - extract strings between quotes
+          # Remove brackets and split by comma
+          IMAGES=$(echo "$DOCKER_IMAGES" | sed 's/^\[//;s/\]$//;s/"//g' | tr ',' '\n')
+          FIRST_IMAGE=""
+
+          while IFS= read -r image; do
+            # Trim whitespace
+            image=$(echo "$image" | xargs)
+            if [ -n "$image" ]; then
+              echo "- \`$image\`"
+              # Store first image for pull command
+              if [ -z "$FIRST_IMAGE" ]; then
+                FIRST_IMAGE="$image"
+              fi
+            fi
+          done <<< "$IMAGES"
 
           echo ""
           echo "**Pull command:**"
           echo "\`\`\`bash"
-          FIRST_IMAGE=$(echo "$DOCKER_IMAGES" | jq -r '.[0]')
           echo "docker pull $FIRST_IMAGE"
           echo "\`\`\`"
           echo ""
@@ -302,9 +313,14 @@ runs:
           echo "### 🐳 Docker Images" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "$DOCKER_IMAGES" | jq -r '.[]' | while read -r image; do
-            echo "- \`$image\`" >> $GITHUB_STEP_SUMMARY
-          done
+          # Parse JSON array without jq
+          IMAGES=$(echo "$DOCKER_IMAGES" | sed 's/^\[//;s/\]$//;s/"//g' | tr ',' '\n')
+          while IFS= read -r image; do
+            image=$(echo "$image" | xargs)
+            if [ -n "$image" ]; then
+              echo "- \`$image\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          done <<< "$IMAGES"
 
           echo "" >> $GITHUB_STEP_SUMMARY
         fi
