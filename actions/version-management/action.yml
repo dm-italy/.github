@@ -236,10 +236,19 @@ runs:
       shell: bash
       run: |
         TAG_NAME="${{ steps.version.outputs.tag_name }}"
-        echo "Pushing branch and new tag: $TAG_NAME"
+        BRANCH_NAME="${{ inputs.git_branch }}"
+
+        # If git_branch is 'update' (default), use current branch instead
+        if [ "$BRANCH_NAME" = "update" ]; then
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "Using current branch: $CURRENT_BRANCH"
+          BRANCH_NAME="$CURRENT_BRANCH"
+        fi
+
+        echo "Pushing branch '$BRANCH_NAME' and new tag: $TAG_NAME"
 
         # Push the branch first
-        git push origin ${{ inputs.git_branch }}
+        git push origin "$BRANCH_NAME"
 
         # Push only the new tag (with --force in case it exists remotely)
         git push origin "refs/tags/$TAG_NAME" --force

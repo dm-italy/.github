@@ -65,7 +65,7 @@ jobs:
 | `tag_prefix` | Prefix personalizzato per i tag | No | `''` |
 | `skip_version_bump` | Salta il bump della versione | No | `false` |
 | `skip_tag_push` | Salta il push dei tag | No | `false` |
-| `git_branch` | Branch git per il push | No | `update` |
+| `git_branch` | Branch git per il push (se 'update' usa branch corrente) | No | `update` |
 | `cleanup_unpushed_tags` | Pulisce tag non pushati | No | `true` |
 | `git_user_name` | Nome utente git per i commit | No | `gitbot` |
 | `git_user_email` | Email utente git per i commit | No | `gitbot@dmconsulting.it` |
@@ -89,7 +89,14 @@ jobs:
 4. **Standard-version Dry-run**: Verifica se ci sono modifiche da versionare
 5. **Version Bump**: Esegue standard-version se necessario
 6. **Tag Creation**: Crea tag con prefix (se specificato)
-7. **Push**: Pusha branch e tag al remote
+7. **Push**: Pusha branch corrente e tag al remote
+
+### 🔄 Branch Push Behavior
+
+- Se `git_branch` è impostato a `'update'` (default): usa il **branch corrente** (`git rev-parse --abbrev-ref HEAD`)
+- Se `git_branch` è un valore custom (es. `'main'`): usa il **branch specificato**
+
+Questo permette di usare l'action su qualsiasi branch senza modificare il workflow.
 
 ## 📝 Conventional Commits
 
