@@ -83,7 +83,6 @@ runs:
       run: |
         TAG_NAME="${{ inputs.tag_name }}"
         RELEASE_NAME="${{ inputs.release_name }}"
-        CUSTOM_BODY="${{ inputs.body }}"
 
         # Use tag name as release name if not provided
         if [ -z "$RELEASE_NAME" ]; then
@@ -93,52 +92,97 @@ runs:
         echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
         echo "Release name: $RELEASE_NAME"
 
-        # Build structured release body
-        RELEASE_BODY="# $RELEASE_NAME\n\n"
-        RELEASE_BODY="${RELEASE_BODY}**Release Date:** ${{ steps.release_date.outputs.date }}\n"
-        RELEASE_BODY="${RELEASE_BODY}**Commit:** ${{ github.sha }}\n"
-        RELEASE_BODY="${RELEASE_BODY}**Branch:** ${{ github.ref_name }}\n\n"
-
-        # Add changelog section
-        RELEASE_BODY="${RELEASE_BODY}${{ steps.changelog.outputs.changelog }}\n\n"
-
-        # Add custom body if provided
-        if [ -n "$CUSTOM_BODY" ]; then
-          RELEASE_BODY="${RELEASE_BODY}${CUSTOM_BODY}\n\n"
-        fi
-
-        # Add Docker images section if provided
-        DOCKER_IMAGES='${{ inputs.docker_images }}'
-        if [ "$DOCKER_IMAGES" != "[]" ]; then
-          RELEASE_BODY="${RELEASE_BODY}## 🐳 Docker Images\n\n"
-          RELEASE_BODY="${RELEASE_BODY}This release includes the following Docker images:\n\n"
-
-          # Parse JSON array and add each image
-          echo "$DOCKER_IMAGES" | jq -r '.[]' | while read -r image; do
-            RELEASE_BODY="${RELEASE_BODY}- \`$image\`\n"
-          done
-
-          RELEASE_BODY="${RELEASE_BODY}\n**Pull command:**\n\`\`\`bash\n"
-          FIRST_IMAGE=$(echo "$DOCKER_IMAGES" | jq -r '.[0]')
-          RELEASE_BODY="${RELEASE_BODY}docker pull $FIRST_IMAGE\n\`\`\`\n\n"
-        fi
-
-        # Add comparison link if previous tag provided
-        if [ -n "${{ inputs.previous_tag }}" ]; then
-          RELEASE_BODY="${RELEASE_BODY}---\n\n"
-          RELEASE_BODY="${RELEASE_BODY}**Full Changelog**: "
-          RELEASE_BODY="${RELEASE_BODY}[${{ inputs.previous_tag }}...$TAG_NAME]"
-          RELEASE_BODY="${RELEASE_BODY}(${{ github.server_url }}/${{ github.repository }}/compare/${{ inputs.previous_tag }}...$TAG_NAME)\n"
-        fi
-
-        # Save to output (escape newlines for GitHub Actions)
+        # Build release body header safely
         {
-          echo "release_body<<EOF"
-          echo -e "$RELEASE_BODY"
-          echo "EOF"
+          echo "release_body_header<<HEADER_EOF"
+          echo "# $RELEASE_NAME"
+          echo ""
+          echo "**Release Date:** ${{ steps.release_date.outputs.date }}"
+          echo "**Commit:** ${{ github.sha }}"
+          echo "**Branch:** ${{ github.ref_name }}"
+          echo ""
+          echo "HEADER_EOF"
         } >> $GITHUB_OUTPUT
 
         echo "✓ Release metadata prepared"
+
+    - name: Prepare Docker images section
+      id: docker
+      if: inputs.docker_images != '[]'
+      shell: bash
+      run: |
+        DOCKER_IMAGES='${{ inputs.docker_images }}'
+
+        {
+          echo "docker_section<<DOCKER_EOF"
+          echo ""
+          echo "## 🐳 Docker Images"
+          echo ""
+          echo "This release includes the following Docker images:"
+          echo ""
+
+          # Parse JSON array and add each image
+          echo "$DOCKER_IMAGES" | jq -r '.[]' | while read -r image; do
+            echo "- \`$image\`"
+          done
+
+          echo ""
+          echo "**Pull command:**"
+          echo "\`\`\`bash"
+          FIRST_IMAGE=$(echo "$DOCKER_IMAGES" | jq -r '.[0]')
+          echo "docker pull $FIRST_IMAGE"
+          echo "\`\`\`"
+          echo ""
+          echo "DOCKER_EOF"
+        } >> $GITHUB_OUTPUT
+
+    - name: Prepare comparison link
+      id: comparison
+      if: inputs.previous_tag != ''
+      shell: bash
+      run: |
+        TAG_NAME="${{ inputs.tag_name }}"
+        {
+          echo "comparison_section<<COMPARISON_EOF"
+          echo "---"
+          echo ""
+          echo "**Full Changelog**: [${{ inputs.previous_tag }}...$TAG_NAME](${{ github.server_url }}/${{ github.repository }}/compare/${{ inputs.previous_tag }}...$TAG_NAME)"
+          echo "COMPARISON_EOF"
+        } >> $GITHUB_OUTPUT
+
+    - name: Build final release body
+      id: body
+      shell: bash
+      run: |
+        # Combine all sections safely using heredoc
+        {
+          echo "final_body<<FINAL_EOF"
+          cat <<'HEADER'
+        ${{ steps.prepare.outputs.release_body_header }}
+        HEADER
+          cat <<'CHANGELOG'
+        ${{ steps.changelog.outputs.changelog }}
+        CHANGELOG
+          if [ -n "${{ inputs.body }}" ]; then
+            echo ""
+            cat <<'CUSTOM'
+        ${{ inputs.body }}
+        CUSTOM
+          fi
+          if [ -n "${{ steps.docker.outputs.docker_section }}" ]; then
+            cat <<'DOCKER'
+        ${{ steps.docker.outputs.docker_section }}
+        DOCKER
+          fi
+          if [ -n "${{ steps.comparison.outputs.comparison_section }}" ]; then
+            cat <<'COMPARISON'
+        ${{ steps.comparison.outputs.comparison_section }}
+        COMPARISON
+          fi
+          echo "FINAL_EOF"
+        } >> $GITHUB_OUTPUT
+
+        echo "✓ Release body assembled"
 
     - name: Download artifacts
       if: inputs.artifacts != ''
@@ -192,7 +236,7 @@ runs:
       with:
         tag_name: ${{ inputs.tag_name }}
         name: ${{ steps.prepare.outputs.release_name }}
-        body: ${{ steps.prepare.outputs.release_body }}
+        body: ${{ steps.body.outputs.final_body }}
         draft: ${{ inputs.draft == 'true' }}
         prerelease: ${{ inputs.prerelease == 'true' }}
         generate_release_notes: ${{ inputs.generate_release_notes == 'true' }}
