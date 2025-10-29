@@ -252,7 +252,6 @@ runs:
         # Determine which step provided the version outputs
         NEW_VERSION="${{ steps.version.outputs.new_version || steps.version-fallback.outputs.new_version }}"
         VERSION_CHANGED="${{ steps.version.outputs.version_changed || steps.version-fallback.outputs.version_changed }}"
-        CHANGELOG="${{ steps.version.outputs.changelog || steps.version-fallback.outputs.changelog }}"
         TAG_NAME="${{ steps.version.outputs.tag_name }}"
 
         echo ""
@@ -279,4 +278,8 @@ runs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Changelog" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "$CHANGELOG" >> $GITHUB_STEP_SUMMARY
+
+        # Write changelog safely using cat with heredoc to avoid command injection
+        cat >> $GITHUB_STEP_SUMMARY <<'CHANGELOG_EOF'
+        ${{ steps.version.outputs.changelog || steps.version-fallback.outputs.changelog }}
+        CHANGELOG_EOF
