@@ -275,6 +275,21 @@ L'action genera un summary nel workflow con:
 - 📦 Lista artifacts
 - 🐳 Docker images
 
+## 🔒 Security
+
+### Command Injection Protection
+
+Questa action è **protetta da command injection**. Changelog e contenuti custom con caratteri speciali non vengono eseguiti come comandi shell.
+
+**Esempio problema risolto:**
+```
+# Changelog contenente: rawValue, MachineDeltaDataEto
+# Prima: ❌ rawValue: command not found
+# Ora: ✅ Contenuto visualizzato correttamente
+```
+
+Tutti i contenuti utente passano attraverso heredoc con quote (`<<'EOF'`) per prevenire l'esecuzione di codice.
+
 ## 🆚 Differenze da actions/create-release
 
 | Feature | actions/create-release | Questa action |
@@ -286,6 +301,7 @@ L'action genera un summary nel workflow con:
 | Template | ❌ Base | ✅ Strutturato |
 | Docker images | ❌ | ✅ Con pull commands |
 | Artifacts | ❌ Manuale | ✅ Automatico |
+| Security | ⚠️ Command injection | ✅ Protetto |
 
 ## 🔗 Link utili
 
