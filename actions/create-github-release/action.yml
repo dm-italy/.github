@@ -165,33 +165,50 @@ runs:
       id: body
       shell: bash
       run: |
-        # Combine all sections safely using heredoc
-        {
-          echo "final_body<<FINAL_EOF"
-          cat <<'HEADER'
+        # Combine all sections safely using a temporary file to avoid heredoc issues
+        BODY_FILE=$(mktemp)
+
+        # Write header
+        cat >> "$BODY_FILE" << 'HEADER_EOF'
         ${{ steps.prepare.outputs.release_body_header }}
-        HEADER
-          cat <<'CHANGELOG'
+        HEADER_EOF
+
+        # Write changelog
+        cat >> "$BODY_FILE" << 'CHANGELOG_EOF'
         ${{ steps.changelog.outputs.changelog }}
-        CHANGELOG
-          if [ -n "${{ inputs.body }}" ]; then
-            echo ""
-            cat <<'CUSTOM'
+        CHANGELOG_EOF
+
+        # Write custom body if present
+        if [ -n "${{ inputs.body }}" ]; then
+          echo "" >> "$BODY_FILE"
+          cat >> "$BODY_FILE" << 'CUSTOM_EOF'
         ${{ inputs.body }}
-        CUSTOM
-          fi
-          if [ -n "${{ steps.docker.outputs.docker_section }}" ]; then
-            cat <<'DOCKER'
+        CUSTOM_EOF
+        fi
+
+        # Write Docker section if present
+        if [ -n "${{ steps.docker.outputs.docker_section }}" ]; then
+          cat >> "$BODY_FILE" << 'DOCKER_EOF'
         ${{ steps.docker.outputs.docker_section }}
-        DOCKER
-          fi
-          if [ -n "${{ steps.comparison.outputs.comparison_section }}" ]; then
-            cat <<'COMPARISON'
+        DOCKER_EOF
+        fi
+
+        # Write comparison section if present
+        if [ -n "${{ steps.comparison.outputs.comparison_section }}" ]; then
+          cat >> "$BODY_FILE" << 'COMPARISON_EOF'
         ${{ steps.comparison.outputs.comparison_section }}
-        COMPARISON
-          fi
-          echo "FINAL_EOF"
+        COMPARISON_EOF
+        fi
+
+        # Output to GITHUB_OUTPUT using the temp file
+        {
+          echo "final_body<<FINAL_BODY_EOF"
+          cat "$BODY_FILE"
+          echo "FINAL_BODY_EOF"
         } >> $GITHUB_OUTPUT
+
+        # Cleanup
+        rm -f "$BODY_FILE"
 
         echo "✓ Release body assembled"
 
