@@ -164,40 +164,40 @@ runs:
     - name: Build final release body
       id: body
       shell: bash
+      env:
+        INPUT_BODY: ${{ inputs.body }}
+        HEADER_CONTENT: ${{ steps.prepare.outputs.release_body_header }}
+        CHANGELOG_CONTENT: ${{ steps.changelog.outputs.changelog }}
+        DOCKER_CONTENT: ${{ steps.docker.outputs.docker_section }}
+        COMPARISON_CONTENT: ${{ steps.comparison.outputs.comparison_section }}
       run: |
-        # Combine all sections safely using a temporary file to avoid heredoc issues
+        # Combine all sections safely using environment variables to avoid shell interpretation
         BODY_FILE=$(mktemp)
 
         # Write header
-        cat >> "$BODY_FILE" << 'HEADER_EOF'
-        ${{ steps.prepare.outputs.release_body_header }}
-        HEADER_EOF
+        if [ -n "$HEADER_CONTENT" ]; then
+          printf '%s\n' "$HEADER_CONTENT" >> "$BODY_FILE"
+        fi
 
         # Write changelog
-        cat >> "$BODY_FILE" << 'CHANGELOG_EOF'
-        ${{ steps.changelog.outputs.changelog }}
-        CHANGELOG_EOF
+        if [ -n "$CHANGELOG_CONTENT" ]; then
+          printf '%s\n' "$CHANGELOG_CONTENT" >> "$BODY_FILE"
+        fi
 
         # Write custom body if present
-        if [ -n "${{ inputs.body }}" ]; then
+        if [ -n "$INPUT_BODY" ]; then
           echo "" >> "$BODY_FILE"
-          cat >> "$BODY_FILE" << 'CUSTOM_EOF'
-        ${{ inputs.body }}
-        CUSTOM_EOF
+          printf '%s\n' "$INPUT_BODY" >> "$BODY_FILE"
         fi
 
         # Write Docker section if present
-        if [ -n "${{ steps.docker.outputs.docker_section }}" ]; then
-          cat >> "$BODY_FILE" << 'DOCKER_EOF'
-        ${{ steps.docker.outputs.docker_section }}
-        DOCKER_EOF
+        if [ -n "$DOCKER_CONTENT" ]; then
+          printf '%s\n' "$DOCKER_CONTENT" >> "$BODY_FILE"
         fi
 
         # Write comparison section if present
-        if [ -n "${{ steps.comparison.outputs.comparison_section }}" ]; then
-          cat >> "$BODY_FILE" << 'COMPARISON_EOF'
-        ${{ steps.comparison.outputs.comparison_section }}
-        COMPARISON_EOF
+        if [ -n "$COMPARISON_CONTENT" ]; then
+          printf '%s\n' "$COMPARISON_CONTENT" >> "$BODY_FILE"
         fi
 
         # Output to GITHUB_OUTPUT using the temp file
