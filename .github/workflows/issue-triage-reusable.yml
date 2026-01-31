@@ -40,39 +40,188 @@ jobs:
              --allowedTools "Bash(gh:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(grep:*),Read,Write,Edit"
               
           prompt: |
-            Analizza la issue #${{ github.event.issue.number }} e posta un commento con il PIANO DI IMPLEMENTAZIONE.
+            Sei un Technical Analyst per DM Consulting. Analizza la issue #${{ github.event.issue.number }}.
 
-            STEP 1: Leggi la issue
+            AUTORE ISSUE: @${{ github.event.issue.user.login }}
+
+            ═══════════════════════════════════════════════════════════
+            SISTEMA DI PRIORITÀ (basato su Story Points)
+            ═══════════════════════════════════════════════════════════
+
+            | Punti | Priorità | Label | Significato |
+            |-------|----------|-------|-------------|
+            | 1-2   | 🟢 Low      | priority:low      | Quick win, può aspettare |
+            | 3-5   | 🟡 Medium   | priority:medium   | Lavoro standard |
+            | 8     | 🟠 High     | priority:high     | Complesso, richiede focus |
+            | 13+   | 🔴 Critical | priority:critical | Epic, da spezzare in subtask |
+
+            ═══════════════════════════════════════════════════════════
+            FASE 1: RACCOLTA INFORMAZIONI
+            ═══════════════════════════════════════════════════════════
+
+            1.1 Leggi la issue corrente:
             gh issue view ${{ github.event.issue.number }}
 
-            STEP 2: Analizza il codebase per capire i file coinvolti
+            1.2 Cerca issue simili aperte (potenziali duplicati):
+            gh issue list --state open --limit 50 --json number,title,body
 
-            STEP 3: Posta il commento con questo comando:
-            gh issue comment ${{ github.event.issue.number }} --body "IL_TUO_COMMENTO"
+            1.3 Cerca issue chiuse di recente correlate:
+            gh issue list --state closed --limit 30 --json number,title,body,closedAt
 
-            Il commento DEVE essere in ITALIANO e seguire ESATTAMENTE questo formato compatto:
+            1.4 Cerca PR recenti che potrebbero aver fixato il problema:
+            gh pr list --state merged --limit 20 --json number,title,body,mergedAt
 
-            ---
-            ## 🔍 Analisi
-            [2-3 frasi che spiegano il problema]
+            1.5 Controlla commit recenti:
+            git log --oneline -30
+
+            1.6 Analizza il codebase per capire la complessità:
+            - Quanti file sono coinvolti?
+            - Ci sono dipendenze complesse?
+            - Serve migrazione database?
+            - Impatta più microservizi?
+
+            ═══════════════════════════════════════════════════════════
+            FASE 2: DECISIONE (scegli UNA sola azione)
+            ═══════════════════════════════════════════════════════════
+
+            ─────────────────────────────────────────────────────────
+            CASO A - ISSUE DUPLICATA
+            ─────────────────────────────────────────────────────────
+            Se trovi un'altra issue APERTA con la stessa richiesta:
+
+            gh issue comment ${{ github.event.issue.number }} --body "## 🔄 Issue duplicata
+
+            Questa issue è un duplicato di #[NUMERO_ORIGINALE].
+
+            Continua la discussione nella issue originale.
+
+            /cc @${{ github.event.issue.user.login }}"
+
+            gh issue close ${{ github.event.issue.number }} --reason "not planned" --comment "Chiusa come duplicato di #[NUMERO]"
+            gh issue edit ${{ github.event.issue.number }} --add-label "duplicate"
+
+            ─────────────────────────────────────────────────────────
+            CASO B - GIÀ FIXATA
+            ─────────────────────────────────────────────────────────
+            Se trovi PR merged o commit che ha già risolto:
+
+            gh issue comment ${{ github.event.issue.number }} --body "## ✅ Già risolto
+
+            Risolto in:
+            - PR #[NUMERO] / Commit [SHA]
+            - Merged il [DATA]
+
+            Se il problema persiste, riapri con dettagli aggiuntivi.
+
+            /cc @${{ github.event.issue.user.login }}"
+
+            gh issue close ${{ github.event.issue.number }} --reason "completed"
+
+            ─────────────────────────────────────────────────────────
+            CASO C - DETTAGLI INSUFFICIENTI
+            ─────────────────────────────────────────────────────────
+            Se mancano informazioni essenziali:
+
+            gh issue comment ${{ github.event.issue.number }} --body "## ❓ Servono più dettagli
+
+            @${{ github.event.issue.user.login }} per procedere servono:
+
+            **Mancante:**
+            - [ ] [Cosa manca 1]
+            - [ ] [Cosa manca 2]
+
+            **Domande:**
+            1. [Domanda 1]
+            2. [Domanda 2]
+
+            Aggiorna la issue e menziona @claude per nuova analisi."
+
+            gh issue edit ${{ github.event.issue.number }} --add-label "needs-info"
+
+            ─────────────────────────────────────────────────────────
+            CASO D - ISSUE VALIDA → TRIAGE COMPLETO
+            ─────────────────────────────────────────────────────────
+            Se la issue è nuova, unica, con dettagli sufficienti:
+
+            STEP 1: Stima gli Story Points
+            - 1 punto: Fix typo, config change, <1h
+            - 2 punti: Bug semplice, 1 file, 1-2h
+            - 3 punti: Feature piccola, 2-3 file, 2-4h
+            - 5 punti: Feature media, più file, 4-8h
+            - 8 punti: Feature complessa, più servizi, 1-2 giorni
+            - 13 punti: Epic, migrazione, architettura, 3-5 giorni
+
+            STEP 2: Determina la priorità dalla tabella sopra
+
+            STEP 3: Posta il commento con analisi:
+
+            gh issue comment ${{ github.event.issue.number }} --body "## 🔍 Analisi
+            [2-3 frasi sul problema]
 
             ## 📁 File da modificare
-            - `path/to/file1.ts` - descrizione breve
-            - `path/to/file2.py` - descrizione breve
+            - \`path/file1.ts\` - descrizione
+            - \`path/file2.py\` - descrizione
 
             ## 📋 Piano operativo
-            1. **[Azione 1]**: descrizione concisa
-            2. **[Azione 2]**: descrizione concisa
-            3. **[Azione 3]**: descrizione concisa
+            1. **[Azione]**: descrizione
+            2. **[Azione]**: descrizione
+            3. **[Azione]**: descrizione
 
-            ## ⏱️ Stima: X punti | 🟢/🟡/🔴 Complessità
+            ## 📊 Stima
+            | Story Points | Complessità | Priorità |
+            |--------------|-------------|----------|
+            | **X** | 🟢/🟡/🟠/🔴 | [PRIORITY_LABEL] |
+
+            **Motivazione**: [1 frase che spiega la stima]
+
             ---
+            *Triage automatico by Claude*"
 
-            REGOLE:
-            - Massimo 30 righe totali
-            - No spiegazioni verbose
-            - Focus su COSA FARE, non su analisi teorica
-            - Il piano deve essere eseguibile da uno sviluppatore e da claude code
+            STEP 4: Aggiungi le label appropriate:
+
+            # Rimuovi eventuali label di priorità esistenti
+            gh issue edit ${{ github.event.issue.number }} --remove-label "priority:low" --remove-label "priority:medium" --remove-label "priority:high" --remove-label "priority:critical" 2>/dev/null || true
+
+            # Aggiungi label in base ai punti stimati:
+            # 1-2 punti:
+            gh issue edit ${{ github.event.issue.number }} --add-label "triaged,priority:low,points:X"
+            # 3-5 punti:
+            gh issue edit ${{ github.event.issue.number }} --add-label "triaged,priority:medium,points:X"
+            # 8 punti:
+            gh issue edit ${{ github.event.issue.number }} --add-label "triaged,priority:high,points:X"
+            # 13+ punti:
+            gh issue edit ${{ github.event.issue.number }} --add-label "triaged,priority:critical,points:X"
+
+            # Aggiungi anche label di tipo (bug, enhancement, ecc.) se appropriato
+            gh issue edit ${{ github.event.issue.number }} --add-label "[TIPO]"
+
+            ═══════════════════════════════════════════════════════════
+            CRITERI DI STIMA
+            ═══════════════════════════════════════════════════════════
+
+            Aumenta i punti se:
+            - Serve migrazione database (+3)
+            - Impatta più di 2 microservizi (+2)
+            - Richiede modifiche API breaking (+2)
+            - Manca documentazione/test esistenti (+1)
+            - Codice legacy senza test (+2)
+
+            Riduci i punti se:
+            - Pattern già esistente da copiare (-1)
+            - Test già presenti (-1)
+            - Documentazione chiara (-1)
+
+            ═══════════════════════════════════════════════════════════
+            REGOLE FINALI
+            ═══════════════════════════════════════════════════════════
+
+            - Rispondi SEMPRE in ITALIANO
+            - Esegui SEMPRE un'azione (commento + label)
+            - Menziona SEMPRE l'autore con @${{ github.event.issue.user.login }}
+            - Per duplicati: cita SEMPRE il numero issue originale
+            - Per piani: MASSIMO 25 righe
+            - Assegna SEMPRE una priorità se la issue è valida
+            - Usa UN SOLO comando gh issue edit con tutte le label separate da virgola
             
             IMPORTANTE: Usa lo strumento per commentare sulla issue GitHub con la tua analisi.
 
