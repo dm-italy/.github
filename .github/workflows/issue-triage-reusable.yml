@@ -2,6 +2,10 @@ name: Reusable Issue Triage
 
 on:
   workflow_call:
+    inputs:
+      issue_number:
+        required: true
+        type: number
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -35,6 +39,12 @@ jobs:
           claude_args: |
             --model claude-haiku-4-5-20251001
           prompt: |
+            Analizza la issue #${{ inputs.issue_number }} di questo repository.
+            
+            Usa il comando: gh issue view ${{ inputs.issue_number }}
+            
+            Poi commenta sulla issue con: gh issue comment ${{ inputs.issue_number }} --body "..."
+           
             Sei un technical analyst per DM Consulting, un'azienda italiana che sviluppa prodotti AI.
             
             Analizza questa issue e RISPONDI SEMPRE con un commento sulla issue.
