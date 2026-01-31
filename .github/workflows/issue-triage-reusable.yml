@@ -37,47 +37,42 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: |
-             --allowedTools "Bash(gh issue*),Bash(gh pr*),Read,Write,Edit"
+             --allowedTools "Bash(gh:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(grep:*),Read,Write,Edit"
+              
           prompt: |
-            Analizza la issue #${{ inputs.issue_number }} di questo repository.
-            
-            Usa il comando: gh issue view ${{ inputs.issue_number }}
-            
-            Poi commenta sulla issue con: gh issue comment ${{ inputs.issue_number }} --body "..."
-           
-            Sei un technical analyst per DM Consulting, un'azienda italiana che sviluppa prodotti AI.
-            
-            Analizza questa issue e RISPONDI SEMPRE con un commento sulla issue.
-            
-            Rispondi IN ITALIANO con:
-            
-            ## 📋 Riepilogo
-            Sintesi chiara della richiesta in 2-3 frasi.
-            
-            ## 🎯 Obiettivo
-            Cosa l'utente vuole ottenere concretamente.
-            
-            ## 📦 Componenti coinvolti
-            Analizza il codebase e identifica:
-            - Moduli/servizi interessati
-            - File che probabilmente dovranno essere modificati
-            - Bounded context DDD coinvolto (se applicabile)
-            
-            ## ⚙️ Requisiti tecnici
-            - Prerequisiti necessari
-            - Dipendenze da considerare
-            - Impatto su altri componenti
-            
-            ## ✅ Criteri di accettazione
-            Lista di condizioni per considerare la issue completata.
-            
-            ## 📊 Stima
-            - **Complessità**: 🟢 Bassa / 🟡 Media / 🔴 Alta
-            - **Story Points suggeriti**: (1, 2, 3, 5, 8, 13)
-            - **Motivazione**: breve spiegazione della stima
-            
-            ## 🏷️ Label suggerite
-            Suggerisci label appropriate (bug, enhancement, documentation, ecc.)
+            Analizza la issue #${{ github.event.issue.number }} e posta un commento con il PIANO DI IMPLEMENTAZIONE.
+
+            STEP 1: Leggi la issue
+            gh issue view ${{ github.event.issue.number }}
+
+            STEP 2: Analizza il codebase per capire i file coinvolti
+
+            STEP 3: Posta il commento con questo comando:
+            gh issue comment ${{ github.event.issue.number }} --body "IL_TUO_COMMENTO"
+
+            Il commento DEVE essere in ITALIANO e seguire ESATTAMENTE questo formato compatto:
+
+            ---
+            ## 🔍 Analisi
+            [2-3 frasi che spiegano il problema]
+
+            ## 📁 File da modificare
+            - `path/to/file1.ts` - descrizione breve
+            - `path/to/file2.py` - descrizione breve
+
+            ## 📋 Piano operativo
+            1. **[Azione 1]**: descrizione concisa
+            2. **[Azione 2]**: descrizione concisa
+            3. **[Azione 3]**: descrizione concisa
+
+            ## ⏱️ Stima: X punti | 🟢/🟡/🔴 Complessità
+            ---
+
+            REGOLE:
+            - Massimo 30 righe totali
+            - No spiegazioni verbose
+            - Focus su COSA FARE, non su analisi teorica
+            - Il piano deve essere eseguibile da uno sviluppatore e da claude code
             
             IMPORTANTE: Usa lo strumento per commentare sulla issue GitHub con la tua analisi.
 
