@@ -36,8 +36,8 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          #claude_args: |
-          #  --model claude-haiku-4-5-20251001
+          claude_args: |
+             --allowedTools "Bash(gh issue*),Bash(gh pr*),Read,Write,Edit"
           prompt: |
             Analizza la issue #${{ inputs.issue_number }} di questo repository.
             
