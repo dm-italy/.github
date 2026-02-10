@@ -1,0 +1,42 @@
+# nel repo .github dell'org
+name: Cleanup all GHCR images
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: [self-hosted, X64, Linux]
+    outputs:
+      images: ${{ steps.list.outputs.images }}
+    steps:
+      - name: List all container packages
+        id: list
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_CLEANUP_TOKEN }}
+        run: |
+          images=$(gh api --paginate \
+            "/orgs/dm-italy/packages?package_type=container" \
+            --jq '[.[].name]')
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "Found images: $images"
+
+  cleanup:
+    needs: discover
+    if: needs.discover.outputs.images != '[]'
+    runs-on: [self-hosted, X64, Linux]
+    strategy:
+      matrix:
+        image: ${{ fromJson(needs.discover.outputs.images) }}
+      fail-fast: false
+    steps:
+      - uses: snok/container-retention-policy@v3
+        with:
+          account: dm-italy
+          token: ${{ secrets.GHCR_CLEANUP_TOKEN }}
+          image-names: ${{ matrix.image }}
+          keep-n-most-recent: 5
+          cut-off: 1d
+          tag-selection: "untagged"
