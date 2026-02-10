@@ -195,6 +195,44 @@ jobs:
             # Aggiungi anche label di tipo (bug, enhancement, ecc.) se appropriato
             gh issue edit ${{ github.event.issue.number }} --add-label "[TIPO]"
 
+            ─────────────────────────────────────────────────────────
+            CASO E - AZIONE RICHIESTA ALL'AUTORE
+            ─────────────────────────────────────────────────────────
+            Se la issue richiede verifiche/test da parte dell'autore,
+            OPPURE presenta incongruenze che solo l'autore può chiarire,
+            OPPURE manca uno use case con input atteso e output atteso:
+
+            gh issue comment ${{ github.event.issue.number }} --body "## 🎯 Azione richiesta a @${{ github.event.issue.user.login }}
+
+            Ho analizzato la issue e prima di procedere servono verifiche da parte tua.
+
+            **Cosa devi fare:**
+            - [ ] [Verifica/test 1 - descrizione chiara di cosa controllare]
+            - [ ] [Verifica/test 2 - descrizione chiara]
+
+            **Incongruenze trovate:**
+            > [Descrivi cosa non torna, es: 'Dici che il campo X è vuoto ma dal codice risulta obbligatorio dal 2024']
+
+            **Use case mancante:**
+            Per lavorare su questa issue serve almeno uno use case completo:
+
+            | | Descrizione |
+            |---|---|
+            | **Precondizioni** | [Stato iniziale del sistema] |
+            | **Input** | [Dati/azioni dell'utente] |
+            | **Output atteso** | [Risultato atteso] |
+            | **Output attuale** | [Cosa succede ora, se è un bug] |
+
+            ⚠️ **Questa issue è assegnata a te** fino a completamento delle verifiche.
+            Quando hai finito, aggiorna la issue e menziona @claude per una nuova analisi.
+
+            ---
+            *Triage automatico by Claude*"
+
+            # Assegna la issue all'autore
+            gh issue edit ${{ github.event.issue.number }} --add-assignee "${{ github.event.issue.user.login }}"
+            gh issue edit ${{ github.event.issue.number }} --add-label "awaiting-author,needs-verification"
+            
             ═══════════════════════════════════════════════════════════
             CRITERI DI STIMA
             ═══════════════════════════════════════════════════════════
