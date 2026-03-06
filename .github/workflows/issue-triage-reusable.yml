@@ -33,7 +33,9 @@ jobs:
       
       
       - uses: anthropics/claude-code-action@v1
+        id: claude
         with:
+          display_report: 'false'
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: |
@@ -263,3 +265,27 @@ jobs:
             
             IMPORTANTE: Usa lo strumento per commentare sulla issue GitHub con la tua analisi.
 
+      - name: Job Summary
+        if: always()
+        shell: bash
+        run: |
+          EXEC_FILE="${{ steps.claude.outputs.execution_file }}"
+          if [ -f "$EXEC_FILE" ]; then
+            COST=$(jq -r '.total_cost_usd // 0' "$EXEC_FILE")
+            TURNS=$(jq -r '.num_turns // 0' "$EXEC_FILE")
+            DURATION=$(jq -r '.duration_ms // 0' "$EXEC_FILE")
+            DURATION_S=$((DURATION / 1000))
+            RESULT=$(jq -r '.subtype // "unknown"' "$EXEC_FILE")
+            ISSUE="#${{ inputs.issue_number }}"
+
+            echo "## Claude Triage - ${ISSUE}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Metrica | Valore |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Risultato | ${RESULT} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Costo | \$${COST} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Turns | ${TURNS} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Durata | ${DURATION_S}s |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Nessun output trovato" >> $GITHUB_STEP_SUMMARY
+          fi
