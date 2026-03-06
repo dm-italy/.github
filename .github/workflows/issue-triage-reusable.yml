@@ -280,6 +280,8 @@ jobs:
               if exec_file and os.path.isfile(exec_file):
                   with open(exec_file) as f:
                       data = json.load(f)
+                  if isinstance(data, list):
+                      data = data[-1] if data else {}
                   cost = data.get("total_cost_usd", 0)
                   turns = data.get("num_turns", 0)
                   duration_s = data.get("duration_ms", 0) // 1000
