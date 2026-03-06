@@ -267,25 +267,28 @@ jobs:
 
       - name: Job Summary
         if: always()
-        shell: bash
+        shell: python3 {0}
+        env:
+          EXEC_FILE: ${{ steps.claude.outputs.execution_file }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
         run: |
-          EXEC_FILE="${{ steps.claude.outputs.execution_file }}"
-          if [ -f "$EXEC_FILE" ]; then
-            COST=$(jq -r '.total_cost_usd // 0' "$EXEC_FILE")
-            TURNS=$(jq -r '.num_turns // 0' "$EXEC_FILE")
-            DURATION=$(jq -r '.duration_ms // 0' "$EXEC_FILE")
-            DURATION_S=$((DURATION / 1000))
-            RESULT=$(jq -r '.subtype // "unknown"' "$EXEC_FILE")
-            ISSUE="#${{ inputs.issue_number }}"
-
-            echo "## Claude Triage - ${ISSUE}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Metrica | Valore |" >> $GITHUB_STEP_SUMMARY
-            echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
-            echo "| Risultato | ${RESULT} |" >> $GITHUB_STEP_SUMMARY
-            echo "| Costo | \$${COST} |" >> $GITHUB_STEP_SUMMARY
-            echo "| Turns | ${TURNS} |" >> $GITHUB_STEP_SUMMARY
-            echo "| Durata | ${DURATION_S}s |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "Nessun output trovato" >> $GITHUB_STEP_SUMMARY
-          fi
+          import json, os
+          exec_file = os.environ.get("EXEC_FILE", "")
+          issue = os.environ.get("ISSUE_NUMBER", "?")
+          summary_file = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(summary_file, "a") as sf:
+              if exec_file and os.path.isfile(exec_file):
+                  with open(exec_file) as f:
+                      data = json.load(f)
+                  cost = data.get("total_cost_usd", 0)
+                  turns = data.get("num_turns", 0)
+                  duration_s = data.get("duration_ms", 0) // 1000
+                  result = data.get("subtype", "unknown")
+                  sf.write(f"## Claude Triage - #{issue}\n\n")
+                  sf.write("| Metrica | Valore |\n|---------|--------|\n")
+                  sf.write(f"| Risultato | {result} |\n")
+                  sf.write(f"| Costo | ${cost} |\n")
+                  sf.write(f"| Turns | {turns} |\n")
+                  sf.write(f"| Durata | {duration_s}s |\n")
+              else:
+                  sf.write("Nessun output trovato\n")
