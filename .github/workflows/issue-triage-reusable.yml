@@ -9,6 +9,8 @@ on:
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
+      PROJECT_TOKEN:
+        required: true
 
 jobs:
   triage:
@@ -34,6 +36,8 @@ jobs:
 
       - uses: anthropics/claude-code-action@v1
         id: claude
+        env:
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
         with:
           display_report: 'false'
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -77,9 +81,13 @@ jobs:
 
             Segui questi step:
 
+            IMPORTANTE: Per le chiamate GraphQL ai progetti, usa SEMPRE
+            il token $PROJECT_TOKEN con il flag --header, perché il
+            GITHUB_TOKEN non ha permessi sui Projects V2 dell'org.
+
             STEP A: Trova il progetto e l'item della issue via GraphQL:
             ```bash
-            gh api graphql -f query='
+            GH_TOKEN="$PROJECT_TOKEN" gh api graphql -f query='
               query {
                 repository(owner: "${{ github.repository_owner }}", name: "${{ github.event.repository.name }}") {
                   issue(number: ${{ github.event.issue.number }}) {
@@ -111,7 +119,7 @@ jobs:
 
             STEP C: Setta il valore con la mutation:
             ```bash
-            gh api graphql -f query='
+            GH_TOKEN="$PROJECT_TOKEN" gh api graphql -f query='
               mutation {
                 updateProjectV2ItemFieldValue(input: {
                   projectId: "PROJECT_ID"
