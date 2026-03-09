@@ -13,25 +13,26 @@ on:
 jobs:
   triage:
     runs-on: [self-hosted, X64, Linux]
-    
+
     if: |
       github.event_name == 'issues' ||
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude'))
-    
+
     permissions:
       contents: read
       issues: write
       pull-requests: write
-    
+      repository-projects: write
+
     steps:
       - uses: actions/checkout@v4
-  
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      
-      
+
+
       - uses: anthropics/claude-code-action@v1
         id: claude
         with:
@@ -40,7 +41,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: |
              --allowedTools "Bash(gh:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(grep:*),Read,Write,Edit"
-              
+
           prompt: |
             Sei un Technical Analyst per DM Consulting. Analizza la issue #${{ github.event.issue.number }}.
 
@@ -50,12 +51,84 @@ jobs:
             SISTEMA DI PRIORITÀ (basato su Story Points)
             ═══════════════════════════════════════════════════════════
 
-            | Punti | Priorità | Label | Significato |
-            |-------|----------|-------|-------------|
-            | 1-2   | 🟢 Low      | priority:low      | Quick win, può aspettare |
-            | 3-5   | 🟡 Medium   | priority:medium   | Lavoro standard |
-            | 8     | 🟠 High     | priority:high     | Complesso, richiede focus |
-            | 13+   | 🔴 Critical | priority:critical | Epic, da spezzare in subtask |
+            | Punti | Priorità | Valore campo progetto | Significato |
+            |-------|----------|----------------------|-------------|
+            | 1-2   | 🟢 Low      | Low      | Quick win, può aspettare |
+            | 3-5   | 🟡 Medium   | Medium   | Lavoro standard |
+            | 8     | 🟠 High     | High     | Complesso, richiede focus |
+            | 13+   | 🔴 Critical | Urgent   | Epic, da spezzare in subtask |
+
+            ═══════════════════════════════════════════════════════════
+            ISSUE TYPE (tipi disponibili su GitHub)
+            ═══════════════════════════════════════════════════════════
+
+            Invece di usare label per il tipo, usa il campo "type" nativo
+            della issue di GitHub tramite:
+              gh issue edit <numero> --type "<Type>"
+
+            Tipi disponibili: Bug, Feature, Task
+            (usa il tipo più appropriato in base al contenuto della issue)
+
+            ═══════════════════════════════════════════════════════════
+            COME SETTARE LA PRIORITÀ SUL PROGETTO
+            ═══════════════════════════════════════════════════════════
+
+            La priorità NON va messa come label, ma come campo "Priority"
+            sul progetto GitHub associato alla issue.
+
+            Segui questi step:
+
+            STEP A: Trova il progetto e l'item della issue via GraphQL:
+            ```bash
+            gh api graphql -f query='
+              query {
+                repository(owner: "${{ github.repository_owner }}", name: "${{ github.event.repository.name }}") {
+                  issue(number: ${{ github.event.issue.number }}) {
+                    projectItems(first: 10) {
+                      nodes {
+                        id
+                        project {
+                          id
+                          field(name: "Priority") {
+                            ... on ProjectV2SingleSelectField {
+                              id
+                              options { id name }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }'
+            ```
+
+            STEP B: Dall'output, identifica:
+            - projectId: l'ID del progetto
+            - itemId: l'ID dell'item (la issue nel progetto)
+            - fieldId: l'ID del campo Priority
+            - optionId: l'ID dell'opzione corrispondente alla priorità scelta
+              (matcha il nome: "Low", "Medium", "High", "Urgent")
+
+            STEP C: Setta il valore con la mutation:
+            ```bash
+            gh api graphql -f query='
+              mutation {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: "PROJECT_ID"
+                  itemId: "ITEM_ID"
+                  fieldId: "FIELD_ID"
+                  value: { singleSelectOptionId: "OPTION_ID" }
+                }) {
+                  projectV2Item { id }
+                }
+              }'
+            ```
+
+            Se la issue non è associata a nessun progetto, salta il
+            settaggio della priorità sul progetto e metti una nota nel
+            commento: "⚠️ Issue non associata a un progetto, priorità
+            non settata automaticamente."
 
             ═══════════════════════════════════════════════════════════
             FASE 1: RACCOLTA INFORMAZIONI
@@ -155,7 +228,14 @@ jobs:
 
             STEP 2: Determina la priorità dalla tabella sopra
 
-            STEP 3: Posta il commento con analisi:
+            STEP 3: Setta il tipo della issue:
+            # Determina il tipo appropriato: Bug, Feature, o Task
+            gh issue edit ${{ github.event.issue.number }} --type "[TIPO]"
+
+            STEP 4: Setta la priorità sul progetto (segui le istruzioni
+            nella sezione "COME SETTARE LA PRIORITÀ SUL PROGETTO" sopra)
+
+            STEP 5: Posta il commento con analisi:
 
             gh issue comment ${{ github.event.issue.number }} --body "## 🔍 Analisi
             [2-3 frasi sul problema]
@@ -170,32 +250,21 @@ jobs:
             3. **[Azione]**: descrizione
 
             ## 📊 Stima
-            | Story Points | Complessità | Priorità |
-            |--------------|-------------|----------|
-            | **X** | 🟢/🟡/🟠/🔴 | [PRIORITY_LABEL] |
+            | Story Points | Complessità | Priorità | Tipo |
+            |--------------|-------------|----------|------|
+            | **X** | 🟢/🟡/🟠/🔴 | [PRIORITY] | [TIPO] |
 
             **Motivazione**: [1 frase che spiega la stima]
 
             ---
             *Triage automatico by Claude*"
 
-            STEP 4: Aggiungi le label appropriate:
+            STEP 6: Aggiungi le label operative (solo triaged e points):
+            gh issue edit ${{ github.event.issue.number }} --add-label "triaged,points:X"
 
-            # Rimuovi eventuali label di priorità esistenti
-            gh issue edit ${{ github.event.issue.number }} --remove-label "priority:low" --remove-label "priority:medium" --remove-label "priority:high" --remove-label "priority:critical" 2>/dev/null || true
-
-            # Aggiungi label in base ai punti stimati:
-            # 1-2 punti:
-            gh issue edit ${{ github.event.issue.number }} --add-label "triaged,priority:low,points:X"
-            # 3-5 punti:
-            gh issue edit ${{ github.event.issue.number }} --add-label "triaged,priority:medium,points:X"
-            # 8 punti:
-            gh issue edit ${{ github.event.issue.number }} --add-label "triaged,priority:high,points:X"
-            # 13+ punti:
-            gh issue edit ${{ github.event.issue.number }} --add-label "triaged,priority:critical,points:X"
-
-            # Aggiungi anche label di tipo (bug, enhancement, ecc.) se appropriato
-            gh issue edit ${{ github.event.issue.number }} --add-label "[TIPO]"
+            NOTA: NON aggiungere label di tipo (bug, enhancement, ecc.)
+            né label di priorità (priority:*). Il tipo viene gestito dal
+            campo type nativo e la priorità dal campo Priority del progetto.
 
             ─────────────────────────────────────────────────────────
             CASO E - AZIONE RICHIESTA ALL'AUTORE
@@ -234,7 +303,7 @@ jobs:
             # Assegna la issue all'autore
             gh issue edit ${{ github.event.issue.number }} --add-assignee "${{ github.event.issue.user.login }}"
             gh issue edit ${{ github.event.issue.number }} --add-label "awaiting-author,needs-verification"
-            
+
             ═══════════════════════════════════════════════════════════
             CRITERI DI STIMA
             ═══════════════════════════════════════════════════════════
@@ -256,13 +325,15 @@ jobs:
             ═══════════════════════════════════════════════════════════
 
             - Rispondi SEMPRE in ITALIANO
-            - Esegui SEMPRE un'azione (commento + label)
+            - Esegui SEMPRE un'azione (commento + tipo/priorità)
             - Menziona SEMPRE l'autore con @${{ github.event.issue.user.login }}
             - Per duplicati: cita SEMPRE il numero issue originale
             - Per piani: MASSIMO 25 righe
             - Assegna SEMPRE una priorità se la issue è valida
+            - NON usare label per tipo e priorità: usa il campo type
+              nativo e il campo Priority del progetto
             - Usa UN SOLO comando gh issue edit con tutte le label separate da virgola
-            
+
             IMPORTANTE: Usa lo strumento per commentare sulla issue GitHub con la tua analisi.
 
       - name: Job Summary
