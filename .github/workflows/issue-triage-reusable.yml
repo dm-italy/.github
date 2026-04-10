@@ -33,7 +33,6 @@ jobs:
         with:
           bun-version: latest
 
-
       - uses: anthropics/claude-code-action@v1
         id: claude
         env:
@@ -43,7 +42,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: |
-             --allowedTools "Bash(gh:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(grep:*),Read,Write,Edit"
+             --allowedTools "Bash(gh:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(grep:*),Bash(jq:*),Read,Write,Edit"
 
           prompt: |
             Sei un Technical Analyst per DM Consulting. Analizza la issue #${{ github.event.issue.number }}.
@@ -156,24 +155,72 @@ jobs:
             1.5 Controlla commit recenti:
             git log --oneline -30
 
-            1.6 Analizza il codebase per capire la complessità:
+            1.6 Controlla i cross-reference nativi di GitHub sulla issue corrente.
+            Questi sono i riferimenti espliciti fatti da altre issue/PR tramite
+            la timeline ufficiale di GitHub:
+            ```bash
+            gh api repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/issues/${{ github.event.issue.number }}/timeline \
+              --jq '[.[] | select(.event == "cross-referenced") | {
+                source_number: .source.issue.number,
+                source_title: .source.issue.title,
+                source_state: .source.issue.state,
+                source_url: .source.issue.html_url
+              }]'
+            ```
+
+            1.7 Cerca issue (aperte e chiuse) che menzionano esplicitamente
+            il numero di questa issue nel loro body o titolo:
+            ```bash
+            gh issue list --state all --limit 100 \
+              --json number,title,body,state \
+              | jq --arg n "${{ github.event.issue.number }}" \
+                '[.[] | select(
+                  (.body // "" | test("#"+$n+"\\b")) or
+                  (.title // "" | test("#"+$n+"\\b"))
+                ) | {number, title, state}]'
+            ```
+
+            1.8 Analizza il codebase per capire la complessità:
             - Quanti file sono coinvolti?
             - Ci sono dipendenze complesse?
             - Serve migrazione database?
             - Impatta più microservizi?
 
             ═══════════════════════════════════════════════════════════
+            FASE 1B: VALUTAZIONE INTERAZIONI
+            ═══════════════════════════════════════════════════════════
+
+            Dopo aver eseguito i punti 1.6 e 1.7, classifica ogni issue
+            trovata in UNA delle seguenti categorie:
+
+            🔴 DUPLICATO ESATTO
+            Stessa funzionalità, stesso problema, stesso contesto, stessa
+            soluzione attesa. Non aggiunge nulla di nuovo rispetto all'originale.
+            → Azione: chiudi automaticamente (vai a CASO A1)
+
+            🟡 CORRELATA
+            Stessa area tecnica o stessa feature, ma scope, contesto o
+            soluzione diversa. Le due issue possono coesistere.
+            Esempi: "dipende da", "bloccata da", "estende", "alternativa a".
+            → Azione: cita nel commento senza chiudere (vai a CASO A2 / CASO D)
+
+            ⚫ NON PERTINENTE
+            La menzione è incidentale (es. citazione in un contesto diverso).
+            → Azione: ignora
+
+            ═══════════════════════════════════════════════════════════
             FASE 2: DECISIONE (scegli UNA sola azione)
             ═══════════════════════════════════════════════════════════
 
             ─────────────────────────────────────────────────────────
-            CASO A - ISSUE DUPLICATA
+            CASO A1 - ISSUE DUPLICATA ESATTA
             ─────────────────────────────────────────────────────────
-            Se trovi un'altra issue APERTA con la stessa richiesta:
+            Applica solo se hai classificato l'issue come 🔴 DUPLICATO ESATTO
+            nella Fase 1B.
 
             gh issue comment ${{ github.event.issue.number }} --body "## 🔄 Issue duplicata
 
-            Questa issue è un duplicato di #[NUMERO_ORIGINALE].
+            Questa issue è un duplicato di #[NUMERO_ORIGINALE]: *[TITOLO]*.
 
             Continua la discussione nella issue originale.
 
@@ -181,6 +228,13 @@ jobs:
 
             gh issue close ${{ github.event.issue.number }} --reason "not planned" --comment "Chiusa come duplicato di #[NUMERO]"
             gh issue edit ${{ github.event.issue.number }} --add-label "duplicate"
+
+            ─────────────────────────────────────────────────────────
+            CASO A2 - ISSUE CORRELATA (non duplicata)
+            ─────────────────────────────────────────────────────────
+            Applica solo se hai classificato l'issue come 🟡 CORRELATA
+            nella Fase 1B. NON chiudere. Procedi con il triage normale
+            (CASO D) includendo la sezione "🔗 Issue correlate" nel commento.
 
             ─────────────────────────────────────────────────────────
             CASO B - GIÀ FIXATA
@@ -236,7 +290,6 @@ jobs:
             STEP 2: Determina la priorità dalla tabella sopra
 
             STEP 3: Setta il tipo della issue:
-            # Determina il tipo appropriato: Bug, Feature, o Task
             gh issue edit ${{ github.event.issue.number }} --type "[TIPO]"
 
             STEP 4: Setta la priorità sul progetto (segui le istruzioni
@@ -246,6 +299,13 @@ jobs:
 
             gh issue comment ${{ github.event.issue.number }} --body "## 🔍 Analisi
             [2-3 frasi sul problema]
+
+            ## 🔗 Issue correlate
+            <!-- Includi questa sezione SOLO se hai trovato issue 🟡 CORRELATE
+                 nei passi 1.6 e 1.7. Se non ne hai trovate, ometti l'intera sezione. -->
+            | # | Titolo | Stato | Relazione |
+            |---|--------|-------|-----------|
+            | #XX | [Titolo] | 🟢 Open / ⚫ Closed | dipende da / bloccata da / estende / alternativa a |
 
             ## 📁 File da modificare
             - \`path/file1.ts\` - descrizione
@@ -289,7 +349,7 @@ jobs:
             - [ ] [Verifica/test 2 - descrizione chiara]
 
             **Incongruenze trovate:**
-            > [Descrivi cosa non torna, es: 'Dici che il campo X è vuoto ma dal codice risulta obbligatorio dal 2024']
+            > [Descrivi cosa non torna]
 
             **Use case mancante:**
             Per lavorare su questa issue serve almeno uno use case completo:
@@ -307,7 +367,6 @@ jobs:
             ---
             *Triage automatico by Claude*"
 
-            # Assegna la issue all'autore
             gh issue edit ${{ github.event.issue.number }} --add-assignee "${{ github.event.issue.user.login }}"
             gh issue edit ${{ github.event.issue.number }} --add-label "awaiting-author,needs-verification"
 
@@ -334,12 +393,16 @@ jobs:
             - Rispondi SEMPRE in ITALIANO
             - Esegui SEMPRE un'azione (commento + tipo/priorità)
             - Menziona SEMPRE l'autore con @${{ github.event.issue.user.login }}
-            - Per duplicati: cita SEMPRE il numero issue originale
+            - Per duplicati: cita SEMPRE il numero issue originale e il titolo
             - Per piani: MASSIMO 25 righe
             - Assegna SEMPRE una priorità se la issue è valida
             - NON usare label per tipo e priorità: usa il campo type
               nativo e il campo Priority del progetto
             - Usa UN SOLO comando gh issue edit con tutte le label separate da virgola
+            - Esegui SEMPRE i passi 1.6 e 1.7 prima di decidere il caso
+            - Chiudi come duplicato SOLO se la classificazione è 🔴 DUPLICATO ESATTO
+            - Cita le correlate 🟡 nel commento senza chiudere la issue
+            - Ignora le menzioni classificate come ⚫ NON PERTINENTI
 
             IMPORTANTE: Usa lo strumento per commentare sulla issue GitHub con la tua analisi.
 
