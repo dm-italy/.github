@@ -42,7 +42,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: |
-             --allowedTools "Bash(gh:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(grep:*),Bash(jq:*),Read,Write,Edit"
+             --allowedTools "Bash(gh:*),Bash(git log:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(grep:*),Bash(jq:*),Read,Write,Edit"
 
           prompt: |
             Sei un Technical Analyst per DM Consulting. Analizza la issue #${{ github.event.issue.number }}.
@@ -86,7 +86,7 @@ jobs:
 
             STEP A: Trova il progetto e l'item della issue via GraphQL:
             ```bash
-            GH_TOKEN="$PROJECT_TOKEN" gh api graphql -f query='
+            gh api graphql -H "Authorization: token $PROJECT_TOKEN" -f query='
               query {
                 repository(owner: "${{ github.repository_owner }}", name: "${{ github.event.repository.name }}") {
                   issue(number: ${{ github.event.issue.number }}) {
@@ -118,7 +118,7 @@ jobs:
 
             STEP C: Setta il valore con la mutation:
             ```bash
-            GH_TOKEN="$PROJECT_TOKEN" gh api graphql -f query='
+            gh api graphql -H "Authorization: token $PROJECT_TOKEN" -f query='
               mutation {
                 updateProjectV2ItemFieldValue(input: {
                   projectId: "PROJECT_ID"
@@ -209,6 +209,27 @@ jobs:
             → Azione: ignora
 
             ═══════════════════════════════════════════════════════════
+            COME POSTARE COMMENTI SU GITHUB
+            ═══════════════════════════════════════════════════════════
+
+            NON passare MAI il testo del commento inline con `gh issue
+            comment --body "..."`: i backtick usati per il markdown
+            (es. `path/file.ts`) dentro una stringa bash tra doppi
+            apici vengono interpretati come command substitution e la
+            chiamata finisce per essere bloccata dalla allowlist.
+
+            Per OGNI commento, senza eccezioni:
+            1. Scrivi il testo del commento (già in markdown, con lo
+               stesso contenuto mostrato negli esempi sotto) in un
+               file temporaneo con lo strumento Write, es.
+               /tmp/triage-comment.md
+            2. Postalo con:
+               gh issue comment ${{ github.event.issue.number }} --body-file /tmp/triage-comment.md
+            3. Sovrascrivi /tmp/triage-comment.md con Write prima di
+               ogni nuovo commento (non riusare il contenuto di un
+               commento precedente).
+
+            ═══════════════════════════════════════════════════════════
             FASE 2: DECISIONE (scegli UNA sola azione)
             ═══════════════════════════════════════════════════════════
 
@@ -218,14 +239,18 @@ jobs:
             Applica solo se hai classificato l'issue come 🔴 DUPLICATO ESATTO
             nella Fase 1B.
 
-            gh issue comment ${{ github.event.issue.number }} --body "## 🔄 Issue duplicata
+            Scrivi con Write in /tmp/triage-comment.md:
+
+            ## 🔄 Issue duplicata
 
             Questa issue è un duplicato di #[NUMERO_ORIGINALE]: *[TITOLO]*.
 
             Continua la discussione nella issue originale.
 
-            /cc @${{ github.event.issue.user.login }}"
+            /cc @${{ github.event.issue.user.login }}
 
+            Poi esegui:
+            gh issue comment ${{ github.event.issue.number }} --body-file /tmp/triage-comment.md
             gh issue close ${{ github.event.issue.number }} --reason "not planned" --comment "Chiusa come duplicato di #[NUMERO]"
             gh issue edit ${{ github.event.issue.number }} --add-label "duplicate"
 
@@ -241,7 +266,9 @@ jobs:
             ─────────────────────────────────────────────────────────
             Se trovi PR merged o commit che ha già risolto:
 
-            gh issue comment ${{ github.event.issue.number }} --body "## ✅ Già risolto
+            Scrivi con Write in /tmp/triage-comment.md:
+
+            ## ✅ Già risolto
 
             Risolto in:
             - PR #[NUMERO] / Commit [SHA]
@@ -249,8 +276,10 @@ jobs:
 
             Se il problema persiste, riapri con dettagli aggiuntivi.
 
-            /cc @${{ github.event.issue.user.login }}"
+            /cc @${{ github.event.issue.user.login }}
 
+            Poi esegui:
+            gh issue comment ${{ github.event.issue.number }} --body-file /tmp/triage-comment.md
             gh issue close ${{ github.event.issue.number }} --reason "completed"
 
             ─────────────────────────────────────────────────────────
@@ -258,7 +287,9 @@ jobs:
             ─────────────────────────────────────────────────────────
             Se mancano informazioni essenziali:
 
-            gh issue comment ${{ github.event.issue.number }} --body "## ❓ Servono più dettagli
+            Scrivi con Write in /tmp/triage-comment.md:
+
+            ## ❓ Servono più dettagli
 
             @${{ github.event.issue.user.login }} per procedere servono:
 
@@ -270,8 +301,10 @@ jobs:
             1. [Domanda 1]
             2. [Domanda 2]
 
-            Aggiorna la issue e menziona @claude per nuova analisi."
+            Aggiorna la issue e menziona @claude per nuova analisi.
 
+            Poi esegui:
+            gh issue comment ${{ github.event.issue.number }} --body-file /tmp/triage-comment.md
             gh issue edit ${{ github.event.issue.number }} --add-label "needs-info"
 
             ─────────────────────────────────────────────────────────
@@ -295,9 +328,11 @@ jobs:
             STEP 4: Setta la priorità sul progetto (segui le istruzioni
             nella sezione "COME SETTARE LA PRIORITÀ SUL PROGETTO" sopra)
 
-            STEP 5: Posta il commento con analisi:
+            STEP 5: Posta il commento con analisi.
 
-            gh issue comment ${{ github.event.issue.number }} --body "## 🔍 Analisi
+            Scrivi con Write in /tmp/triage-comment.md:
+
+            ## 🔍 Analisi
             [2-3 frasi sul problema]
 
             ## 🔗 Issue correlate
@@ -324,7 +359,10 @@ jobs:
             **Motivazione**: [1 frase che spiega la stima]
 
             ---
-            *Triage automatico by Claude*"
+            *Triage automatico by Claude*
+
+            Poi esegui:
+            gh issue comment ${{ github.event.issue.number }} --body-file /tmp/triage-comment.md
 
             STEP 6: Aggiungi le label operative (solo triaged e points):
             gh issue edit ${{ github.event.issue.number }} --add-label "triaged,points:X"
@@ -340,7 +378,9 @@ jobs:
             OPPURE presenta incongruenze che solo l'autore può chiarire,
             OPPURE manca uno use case con input atteso e output atteso:
 
-            gh issue comment ${{ github.event.issue.number }} --body "## 🎯 Azione richiesta a @${{ github.event.issue.user.login }}
+            Scrivi con Write in /tmp/triage-comment.md:
+
+            ## 🎯 Azione richiesta a @${{ github.event.issue.user.login }}
 
             Ho analizzato la issue e prima di procedere servono verifiche da parte tua.
 
@@ -365,8 +405,10 @@ jobs:
             Quando hai finito, aggiorna la issue e menziona @claude per una nuova analisi.
 
             ---
-            *Triage automatico by Claude*"
+            *Triage automatico by Claude*
 
+            Poi esegui:
+            gh issue comment ${{ github.event.issue.number }} --body-file /tmp/triage-comment.md
             gh issue edit ${{ github.event.issue.number }} --add-assignee "${{ github.event.issue.user.login }}"
             gh issue edit ${{ github.event.issue.number }} --add-label "awaiting-author,needs-verification"
 
