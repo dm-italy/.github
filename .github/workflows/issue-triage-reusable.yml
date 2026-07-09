@@ -39,15 +39,18 @@ jobs:
           PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
         with:
           display_report: 'false'
+          show_full_output: 'true'
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: |
-             --allowedTools "Bash(gh:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(grep:*),Bash(jq:*),Read,Write,Edit"
+             --allowedTools "Bash(gh:*),Bash(git:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(grep:*),Bash(jq:*),Read,Write,Edit"
 
           prompt: |
             Sei un Technical Analyst per DM Consulting. Analizza la issue #${{ github.event.issue.number }}.
 
             AUTORE ISSUE: @${{ github.event.issue.user.login }}
+
+            ${{ github.event_name == 'issue_comment' && 'NOTA IMPORTANTE: questo trigger arriva da un commento su una issue già analizzata in precedenza, molto probabilmente una risposta dell''autore alle domande poste in un CASO E precedente. Prima di decidere, leggi SEMPRE tutti i commenti esistenti sulla issue (non solo il body iniziale) con `gh issue view <numero> --comments`. Anche se esiste già un tuo commento precedente su questa issue, NON considerare il lavoro concluso: rivaluta la issue da zero alla luce delle nuove informazioni fornite e produci SEMPRE una nuova azione (uno dei CASI A1/A2/B/C/D/E), postando un nuovo commento con gh issue comment. Non terminare MAI senza avere eseguito almeno un comando di scrittura (comment/edit/close).' || '' }}
 
             ═══════════════════════════════════════════════════════════
             SISTEMA DI PRIORITÀ (basato su Story Points)
