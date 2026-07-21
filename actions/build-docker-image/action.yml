@@ -175,7 +175,14 @@ runs:
         echo "Preparing build arguments..."
 
         if [ "$BUILD_ARGS" != "{}" ]; then
-          # Convert JSON to --build-arg format using Python
+          # docker/build-push-action's `build-args` input vuole righe
+          # "KEY=VALUE", una per riga: e' lui ad anteporre `--build-arg` per
+          # ciascuna quando costruisce il comando buildx. Pre-formattare qui
+          # con `--build-arg` gia' incluso (join a spazi, come faceva prima)
+          # produce un doppio `--build-arg --build-arg ...`: buildx scarta
+          # silenziosamente gli argomenti successivi invece di fallire, e
+          # l'immagine esce con i default del Dockerfile. Stesso formato di
+          # "Prepare secrets" qui sotto, che questo bug non ce l'ha mai avuto.
           cat > /tmp/parse_build_args.py <<'PYTHON_SCRIPT'
         import json
         import sys
@@ -183,20 +190,19 @@ runs:
         build_args_json = sys.stdin.read().strip()
         if build_args_json and build_args_json != '{}':
             build_args_dict = json.loads(build_args_json)
-            args = []
-            for key, value in build_args_dict.items():
-                # Escape delle quote nel valore
-                escaped_value = str(value).replace('"', '\\"')
-                args.append(f'--build-arg {key}="{escaped_value}"')
-            print(' '.join(args))
+            args = [f'{key}={value}' for key, value in build_args_dict.items()]
+            print('\n'.join(args))
         PYTHON_SCRIPT
 
           BUILD_ARGS_STRING=$(echo "$BUILD_ARGS" | python3 /tmp/parse_build_args.py)
           rm -f /tmp/parse_build_args.py
 
-          echo "build_args_string=$BUILD_ARGS_STRING" >> $GITHUB_OUTPUT
+          echo "build_args_string<<BUILD_ARGS_EOF" >> $GITHUB_OUTPUT
+          echo "$BUILD_ARGS_STRING" >> $GITHUB_OUTPUT
+          echo "BUILD_ARGS_EOF" >> $GITHUB_OUTPUT
           echo "✓ Build arguments prepared"
-          echo "Arguments: $BUILD_ARGS_STRING"
+          echo "Arguments:"
+          echo "$BUILD_ARGS_STRING"
         else
           echo "build_args_string=" >> $GITHUB_OUTPUT
           echo "No build arguments specified"
@@ -210,7 +216,9 @@ runs:
 
         echo "Preparing image labels..."
 
-        # Convert labels to --label format using Python
+        # Stesso formato di "Prepare build arguments": righe "KEY=VALUE", non
+        # pre-flaggate con `--label` (docker/build-push-action lo antepone da
+        # solo). Vedi commento su quello step per il bug che questo evita.
         cat > /tmp/parse_labels.py <<'PYTHON_SCRIPT'
         import json
         import sys
@@ -229,20 +237,16 @@ runs:
             user_labels = json.loads(user_labels_json)
             default_labels.update(user_labels)
 
-        # Convert to --label format
-        labels = []
-        for key, value in default_labels.items():
-            # Escape delle quote nel valore
-            escaped_value = str(value).replace('"', '\\"')
-            labels.append(f'--label {key}="{escaped_value}"')
-
-        print(' '.join(labels))
+        labels = [f'{key}={value}' for key, value in default_labels.items()]
+        print('\n'.join(labels))
         PYTHON_SCRIPT
 
         LABELS_STRING=$(echo "$LABELS" | python3 /tmp/parse_labels.py)
         rm -f /tmp/parse_labels.py
 
-        echo "labels_string=$LABELS_STRING" >> $GITHUB_OUTPUT
+        echo "labels_string<<LABELS_EOF" >> $GITHUB_OUTPUT
+        echo "$LABELS_STRING" >> $GITHUB_OUTPUT
+        echo "LABELS_EOF" >> $GITHUB_OUTPUT
         echo "✓ Labels prepared"
 
     - name: Prepare secrets
