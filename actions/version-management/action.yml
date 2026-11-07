@@ -175,7 +175,7 @@ runs:
         echo "$DRY_RUN_OUTPUT"
 
         # Check if version will change using dry-run
-        if echo "$DRY_RUN_OUTPUT" | grep -q "bumping version"; then
+        if grep -q "bumping version" <<< "$DRY_RUN_OUTPUT"; then
           echo "✓ Version will be bumped"
 
           # Run standard-version with --skip.tag (we'll create tag manually with --force)
